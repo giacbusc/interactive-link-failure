@@ -35,6 +35,7 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 # Silence noisy third-party loggers
+logging.getLogger("os_ken.base.app_manager").setLevel(logging.INFO)
 logging.getLogger("os_ken.ofproto").setLevel(logging.WARNING)
 logging.getLogger("os_ken.lib").setLevel(logging.WARNING)
 logging.getLogger("os_ken.controller").setLevel(logging.INFO)

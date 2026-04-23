@@ -38,18 +38,21 @@ class SpanningTreeManager:
         self._root = root
 
         # BFS
-        visited = {root}
-        queue: deque[int] = deque([root])
+        visited = set()
         tree_edges: set[tuple[int, int]] = set()
 
-        while queue:
-            node = queue.popleft()
-            for neighbor in g.neighbors(node):
-                if neighbor not in visited:
-                    visited.add(neighbor)
-                    tree_edges.add((node, neighbor))
-                    tree_edges.add((neighbor, node))
-                    queue.append(neighbor)
+        for node in sorted(g.nodes):
+            if node not in visited:
+                visited.add(node)
+                queue: deque[int] = deque([node])
+                while queue:
+                    curr = queue.popleft()
+                    for neighbor in g.neighbors(curr):
+                        if neighbor not in visited:
+                            visited.add(neighbor)
+                            tree_edges.add((curr, neighbor))
+                            tree_edges.add((neighbor, curr))
+                            queue.append(neighbor)
 
         self._tree_edges = tree_edges
 
