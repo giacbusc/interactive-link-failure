@@ -121,3 +121,23 @@ class RouteTracker:
                 hex(dpid),
             )
         return purged
+
+    def purge_mac(self, mac: str) -> list[tuple[str, str]]:
+        """Remove all routes involving a given MAC (e.g., host disconnected).
+
+        Returns the list of (src_mac, dst_mac) pairs that were purged.
+        """
+        purged: list[tuple[str, str]] = []
+        with self._lock:
+            for pair in list(self._pair_to_links.keys()):
+                if pair[0] == mac or pair[1] == mac:
+                    purged.append(pair)
+            for pair in purged:
+                self._remove_pair_unsafe(pair)
+        if purged:
+            LOG.info(
+                "RouteTracker: purged %d routes involving disconnected host %s",
+                len(purged),
+                mac,
+            )
+        return purged

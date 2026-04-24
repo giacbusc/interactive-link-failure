@@ -53,6 +53,26 @@ class FaultHandler:
                 port,
             )
 
+        # If this is an edge port (host-facing), purge any hosts learned on it.
+        # The host physically disconnected and may reconnect elsewhere (mobility).
+        # Also delete stale flows for those hosts on ALL switches — otherwise
+        # old path entries will blackhole traffic toward the now-dead port.
+        if link is None:
+            removed = self.forwarding.host_tracker.remove_by_port(dpid, port)
+            if removed:
+                LOG.info(
+                    "FaultHandler: purged hosts on disconnected edge port %s:%d: %s",
+                    hex(dpid),
+                    port,
+                    ", ".join(removed),
+                )
+                # Clean stale flows for each purged host on every switch
+                for mac in removed:
+                    for sw_dpid in self.graph.switches:
+                        self.flow_installer.delete_flows_for_mac(sw_dpid, mac)
+                    # Also purge stale route tracker entries for this host
+                    self.forwarding.route_tracker.purge_mac(mac)
+
         # Remove port from graph (also removes associated link)
         self.graph.remove_port(dpid, port)
 
