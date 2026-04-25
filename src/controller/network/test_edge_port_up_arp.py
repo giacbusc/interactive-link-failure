@@ -5,25 +5,25 @@ from mininet.node import RemoteController, OVSSwitch
 from mininet.log import setLogLevel, info
 
 
-def test_port_up_missing_st_recompute():
+def test_port_up_triggers_st_recompute():
     """
-    Edge Case: Missing spanning-tree recompute after port-up event.
+    Edge Case: Spanning-tree recompute after port-up event.
 
     Verifies that bringing an edge port back UP triggers a spanning-tree
-    recompute and flood-rule refresh. Without it, the reconnected host
-    becomes deaf to broadcast/ARP traffic.
+    recompute and flood-rule refresh, so the reconnected host can receive
+    broadcast/ARP traffic.
 
     Topology: h1 -- s1 -- s2 -- s3 -- h2
 
     Phases:
     1. Baseline ping both directions.
     2. Bring h1-s1 down -- edge-port purge, ST recomputes.
-    3. Bring h1-s1 up -- port re-added to graph.
-    4. Ping h2 -> h1 (fails if ST + flood rules are stale).
-    5. Ping h1 -> h2 (succeeds via unicast packet-in).
+    3. Bring h1-s1 up -- port re-added, ST recomputed, flood rules refreshed.
+    4. Ping h2 -> h1 (should succeed -- flood rules updated after port-up).
+    5. Ping h1 -> h2 (should succeed -- unicast path still works).
 
-    Pass: baseline=0% and asymmetric behavior (h1->h2 succeeds, h2->h1 fails),
-    which confirms stale flood rules.
+    Pass: baseline=0% and both post-port-up pings succeed (0% loss),
+    confirming correct ST recompute after port-up.
     """
     subprocess.run(["mn", "-c"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     net = Mininet(controller=RemoteController, switch=OVSSwitch, build=False)
@@ -54,24 +54,25 @@ def test_port_up_missing_st_recompute():
     net.configLinkStatus("h1", "s1", "down")
     time.sleep(3)
 
-    info("*** 3. Bringing h1-s1 link UP (port re-added, ST NOT recomputed)\n")
+    info(
+        "*** 3. Bringing h1-s1 link UP (port re-added, ST recomputed, flood rules refreshed)\n"
+    )
     net.configLinkStatus("h1", "s1", "up")
     time.sleep(2)
 
     for h in [h1, h2]:
         h.cmd("ip neigh flush all 2>/dev/null")
 
-    info("*** 4. Ping h2 -> h1 (should FAIL -- ARP blackholed at s1)\n")
+    info("*** 4. Ping h2 -> h1 (should SUCCEED -- flood rules updated after port-up)\n")
     loss_h2_to_h1 = net.ping([h2, h1])
 
-    info("*** 5. Ping h1 -> h2 (should SUCCEED -- unicast packet-in triggers path)\n")
+    info("*** 5. Ping h1 -> h2 (should SUCCEED -- unicast path still works)\n")
     loss_h1_to_h2 = net.ping([h1, h2])
 
     net.stop()
     subprocess.run(["mn", "-c"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-    bug_confirmed = loss_h1_to_h2 == 0.0 and loss_h2_to_h1 > 0.0
-    passed = loss_baseline == 0.0 and bug_confirmed
+    passed = loss_baseline == 0.0 and loss_h1_to_h2 == 0.0 and loss_h2_to_h1 == 0.0
 
     if passed:
         print("\n\033[92m=========================================\033[0m")
@@ -89,4 +90,4 @@ def test_port_up_missing_st_recompute():
 if __name__ == "__main__":
     setLogLevel("info")
     info("\n--- Running Port UP ST Recompute Test ---\n")
-    test_port_up_missing_st_recompute()
+    test_port_up_triggers_st_recompute()

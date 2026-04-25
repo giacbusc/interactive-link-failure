@@ -111,6 +111,18 @@ class Backend(app_manager.OSKenApp):
         if ev.state != DEAD_DISPATCHER:
             return
         dpid = dp.id
+
+        # Guard against stale disconnect events: when a switch reconnects,
+        # os-ken creates a new Datapath and the old one fires a DEAD event.
+        # If a newer connection already replaced this dp, skip the cleanup.
+        current_dp = self.flow_installer.get_dp(dpid)
+        if current_dp is not None and current_dp is not dp:
+            LOG.debug(
+                ">>> STALE DISCONNECT dpid=%s — newer connection already active",
+                hex(dpid),
+            )
+            return
+
         LOG.warning(">>> SWITCH DISCONNECTED dpid=%s — cleaning up", hex(dpid))
 
         self.flow_installer.unregister_dp(dpid)
@@ -141,6 +153,7 @@ class Backend(app_manager.OSKenApp):
 
         self.topo_mgr.switch_leave(dp)
         self._ports_initialized.discard(dpid)
+        self.path_computer.invalidate()
         self.st_mgr.compute()
         self._install_all_flood_rules()
         LOG.info(
