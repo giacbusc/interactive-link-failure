@@ -404,16 +404,6 @@ class FlowInstaller:
                     loc.port,
                 )
                 return loc.port
-        # Fallback: pick any edge port on this switch
-        for sw, port in self.graph.edge_ports:
-            if sw == dpid:
-                LOG.debug(
-                    "FlowInstaller: edge port for %s on dpid=%s → port=%d (fallback)",
-                    dst_mac,
-                    hex(dpid),
-                    port,
-                )
-                return port
         LOG.warning(
             "FlowInstaller: no edge port found for %s on dpid=%s", dst_mac, hex(dpid)
         )

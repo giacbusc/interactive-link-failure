@@ -49,8 +49,21 @@ class ForwardingPlane:
             in_port,
         )
 
-        # Learn source location
-        self.host_tracker.learn(src_mac, in_dpid, in_port)
+        # Learn source location — returns previous location if host moved
+        old_loc = self.host_tracker.learn(src_mac, in_dpid, in_port)
+        if old_loc is not None:
+            # Host moved: purge stale flows on the old switch and clean
+            # route tracker entries that involved this host from the old
+            # location.  New flows will be installed below.
+            LOG.info(
+                "Forwarding: %s moved from dpid=%s → dpid=%s — cleaning old flows",
+                src_mac,
+                hex(old_loc.dpid),
+                hex(in_dpid),
+            )
+            self.flow_installer.delete_flows_for_mac(old_loc.dpid, src_mac)
+            self.route_tracker.purge_mac(src_mac)
+            self.path_computer.invalidate_pair(old_loc.dpid, in_dpid)
 
         # Lookup destination
         dst_loc = self.host_tracker.lookup(dst_mac)

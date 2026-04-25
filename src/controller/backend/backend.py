@@ -13,7 +13,12 @@ import logging
 
 from os_ken.base import app_manager
 from os_ken.controller import ofp_event
-from os_ken.controller.handler import CONFIG_DISPATCHER, MAIN_DISPATCHER, set_ev_cls
+from os_ken.controller.handler import (
+    CONFIG_DISPATCHER,
+    DEAD_DISPATCHER,
+    MAIN_DISPATCHER,
+    set_ev_cls,
+)
 from os_ken.controller.controller import Datapath
 from os_ken.ofproto import ofproto_v1_3
 from os_ken.lib.packet import ethernet, packet
@@ -49,7 +54,7 @@ class Backend(app_manager.OSKenApp):
         self.graph = TopologyGraph()
         self.topo_mgr = TopologyManager(self.graph)
         self.st_mgr = SpanningTreeManager(self.graph)
-        self.host_tracker = HostTracker()
+        self.host_tracker = HostTracker(self.graph)
         self.path_computer = PathComputer(self.graph)
         self.route_tracker = RouteTracker()
         self.flow_installer = FlowInstaller(self.graph)
@@ -96,56 +101,58 @@ class Backend(app_manager.OSKenApp):
         self._install_table_miss(dp)
         LOG.info("<<< SWITCH REGISTERED dpid=%s", hex(dp.id))
 
-    @set_ev_cls(ofp_event.EventOFPStateChange, [MAIN_DISPATCHER, CONFIG_DISPATCHER])
+    @set_ev_cls(
+        ofp_event.EventOFPStateChange,
+        [MAIN_DISPATCHER, CONFIG_DISPATCHER, DEAD_DISPATCHER],
+    )
     def _state_change_handler(self, ev) -> None:
         """Handle switch state transitions and disconnection."""
         dp = ev.datapath
-        if ev.state == ofproto_v1_3.OFPCR_ROLE_NOCHANGE:
+        if ev.state != DEAD_DISPATCHER:
             return
-        if hasattr(ev, "state") and ev.state == 0:  # DEAD
-            dpid = dp.id
-            LOG.warning(">>> SWITCH DISCONNECTED dpid=%s — cleaning up", hex(dpid))
+        dpid = dp.id
+        LOG.warning(">>> SWITCH DISCONNECTED dpid=%s — cleaning up", hex(dpid))
 
-            self.flow_installer.unregister_dp(dpid)
+        self.flow_installer.unregister_dp(dpid)
 
-            # Purge routes that involved this switch and delete orphaned
-            # flows on surviving switches. Port-status events handle the
-            # directly-connected links; this catches anything further
-            # upstream (e.g., flows on s1 for path s1→s2→s3 when s2 dies).
-            purged = self.route_tracker.purge_switch(dpid)
-            for src_mac, dst_mac in purged:
-                for surviving_dpid in self.graph.switches:
-                    if surviving_dpid != dpid:
-                        self.flow_installer.delete_flows_for_mac(
-                            surviving_dpid, dst_mac
-                        )
-                        self.flow_installer.delete_flows_for_mac(
-                            surviving_dpid, src_mac
-                        )
+        # Purge routes that involved this switch and delete orphaned
+        # flows on surviving switches. Port-status events handle the
+        # directly-connected links; this catches anything further
+        # upstream (e.g., flows on s1 for path s1→s2→s3 when s2 dies).
+        purged = self.route_tracker.purge_switch(dpid)
+        for src_mac, dst_mac in purged:
+            for surviving_dpid in self.graph.switches:
+                if surviving_dpid != dpid:
+                    self.flow_installer.delete_flows_for_mac(
+                        surviving_dpid, dst_mac
+                    )
+                    self.flow_installer.delete_flows_for_mac(
+                        surviving_dpid, src_mac
+                    )
 
-            # Purge hosts that were attached to the dead switch
-            removed_hosts = []
-            for mac, loc in list(self.host_tracker.hosts.items()):
-                if loc.dpid == dpid:
-                    self.host_tracker.remove_by_port(dpid, loc.port)
-                    removed_hosts.append(mac)
-            if removed_hosts:
-                LOG.info(
-                    "Switch disconnect: purged %d host entries: %s",
-                    len(removed_hosts),
-                    ", ".join(removed_hosts),
-                )
-
-            self.topo_mgr.switch_leave(dp)
-            self._ports_initialized.discard(dpid)
-            self.st_mgr.compute()
-            self._install_all_flood_rules()
+        # Purge hosts that were attached to the dead switch
+        removed_hosts = []
+        for mac, loc in list(self.host_tracker.hosts.items()):
+            if loc.dpid == dpid:
+                self.host_tracker.remove_by_port(dpid, loc.port)
+                removed_hosts.append(mac)
+        if removed_hosts:
             LOG.info(
-                "<<< Switch dpid=%s removed | purged %d routes, %d hosts",
-                hex(dpid),
-                len(purged),
+                "Switch disconnect: purged %d host entries: %s",
                 len(removed_hosts),
+                ", ".join(removed_hosts),
             )
+
+        self.topo_mgr.switch_leave(dp)
+        self._ports_initialized.discard(dpid)
+        self.st_mgr.compute()
+        self._install_all_flood_rules()
+        LOG.info(
+            "<<< Switch dpid=%s removed | purged %d routes, %d hosts",
+            hex(dpid),
+            len(purged),
+            len(removed_hosts),
+        )
 
     # ── Port status ──────────────────────────────────────────────────
 
@@ -170,6 +177,8 @@ class Backend(app_manager.OSKenApp):
         elif reason == ofp.OFPPR_ADD:
             LOG.info(">>> PORT ADDED dpid=%s port=%d", hex(dp.id), port_no)
             self.topo_mgr.port_add(dp, port_no)
+            self.st_mgr.compute()
+            self._install_all_flood_rules()
         elif reason == ofp.OFPPR_MODIFY:
             is_down = bool(ev.msg.desc.state & ofp.OFPPS_LINK_DOWN)
             LOG.info(
@@ -185,6 +194,8 @@ class Backend(app_manager.OSKenApp):
                 self.fault_handler.handle_port_down(dp.id, port_no)
             else:
                 self.topo_mgr.port_modify(dp, port_no, is_down)
+                self.st_mgr.compute()
+                self._install_all_flood_rules()
         else:
             LOG.debug(
                 "PortStatus: unknown reason=%d dpid=%s port=%d",

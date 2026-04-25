@@ -5,7 +5,10 @@ from __future__ import annotations
 import logging
 import threading
 from dataclasses import dataclass
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
+
+if TYPE_CHECKING:
+    from topology import TopologyGraph
 
 LOG = logging.getLogger(__name__)
 
@@ -19,16 +22,16 @@ class HostLocation:
 class HostTracker:
     """Maps MAC addresses to their most recently observed switch + port."""
 
-    def __init__(self) -> None:
+    def __init__(self, graph: Optional[TopologyGraph] = None) -> None:
         self._table: dict[str, HostLocation] = {}
         self._lock = threading.Lock()
+        self._graph = graph
 
-    def learn(self, mac: str, dpid: int, port: int) -> bool:
-        """Learn a host location. Returns True if a new location was recorded.
+    def learn(self, mac: str, dpid: int, port: int) -> Optional[HostLocation]:
+        """Learn a host location.
 
-        Once a host is learned, its location is NOT updated (no mobility in GOAL 1).
-        This prevents broadcast storms from corrupting the host tracker with
-        wrong locations (packets looping through internal ports).
+        Returns the *previous* location if the host moved (so the caller can
+        purge stale flows), or None if the host was brand-new or unchanged.
         """
         with self._lock:
             prev = self._table.get(mac)
@@ -40,26 +43,38 @@ class HostTracker:
                         hex(dpid),
                         port,
                     )
-                else:
+                    return None
+                if not self._is_edge_port(dpid, port):
                     LOG.warning(
-                        "HostTracker: %s seen at dpid=%s port=%d but already known at "
-                        "dpid=%s port=%d — keeping original (GOAL 1: no mobility)",
+                        "HostTracker: %s seen at dpid=%s port=%d (internal) "
+                        "but already known at dpid=%s port=%d — keeping original",
                         mac,
                         hex(dpid),
                         port,
                         hex(prev.dpid),
                         prev.port,
                     )
-                return False
+                    return None
+                LOG.info(
+                    "HostTracker: %s MOVED from dpid=%s port=%d → dpid=%s port=%d",
+                    mac,
+                    hex(prev.dpid),
+                    prev.port,
+                    hex(dpid),
+                    port,
+                )
+                old_loc = prev
+            else:
+                old_loc = None
             self._table[mac] = HostLocation(dpid, port)
         LOG.info(
-            "HostTracker: learned %s → dpid=%s port=%d (new host | total=%d)",
+            "HostTracker: learned %s → dpid=%s port=%d (total=%d)",
             mac,
             hex(dpid),
             port,
             len(self._table),
         )
-        return True
+        return old_loc
 
     def lookup(self, mac: str) -> Optional[HostLocation]:
         with self._lock:
@@ -93,3 +108,13 @@ class HostTracker:
     def hosts(self) -> dict[str, HostLocation]:
         with self._lock:
             return dict(self._table)
+
+    def _is_edge_port(self, dpid: int, port: int) -> bool:
+        """True if (dpid, port) is a known edge (host-facing) port.
+
+        If no graph reference is available, conservatively returns True
+        (allows mobility without the safety check).
+        """
+        if self._graph is None:
+            return True
+        return (dpid, port) in self._graph.edge_ports
