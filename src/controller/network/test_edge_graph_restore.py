@@ -1,3 +1,4 @@
+import sys
 import time
 import subprocess
 from mininet.net import Mininet
@@ -80,6 +81,7 @@ def test_graph_restoration_logic():
             f"\033[91m      FAIL (Init: {loss_init}%, Backup: {loss_backup}%, Restored: {loss_restored}%) \033[0m"
         )
         print("\033[91m=========================================\033[0m\n")
+    sys.exit(0 if passed else 1)
 
 
 if __name__ == "__main__":

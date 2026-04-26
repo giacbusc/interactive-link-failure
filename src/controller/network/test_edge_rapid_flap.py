@@ -1,3 +1,4 @@
+import sys
 import time
 import subprocess
 from mininet.net import Mininet
@@ -6,7 +7,7 @@ from mininet.log import setLogLevel, info
 
 
 def test_rapid_flap_race_conditions():
-    """
+    r"""
     Edge Case: Rapid link flapping and race conditions.
 
     Verifies that the controller remains stable after multiple rapid
@@ -80,6 +81,7 @@ def test_rapid_flap_race_conditions():
             f"\033[91m      FAIL (Initial: {loss_initial}%, Final: {loss_final}%) \033[0m"
         )
         print("\033[91m=========================================\033[0m\n")
+    sys.exit(0 if passed else 1)
 
 
 if __name__ == "__main__":

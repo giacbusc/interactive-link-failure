@@ -1,3 +1,4 @@
+import sys
 import time
 import json
 import subprocess
@@ -322,6 +323,7 @@ def test_rest_api_policy():
         print("\n\033[91m=========================================\033[0m")
         print("\033[91m                 FAIL                    \033[0m")
         print("\033[91m=========================================\033[0m\n")
+    sys.exit(0 if passed else 1)
 
 
 if __name__ == "__main__":

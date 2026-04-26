@@ -1,3 +1,4 @@
+import sys
 import time
 import subprocess
 from mininet.net import Mininet
@@ -6,7 +7,7 @@ from mininet.log import setLogLevel, info
 
 
 def test_k4_mesh_storm_resilience():
-    """
+    r"""
     Edge Case: K4 full mesh storm resilience.
 
     Tests if the spanning-tree algorithm can handle a highly connected
@@ -83,6 +84,7 @@ def test_k4_mesh_storm_resilience():
             f"\033[91m      FAIL (Full Mesh: {loss_full}%, Sliced: {loss_sliced}%) \033[0m"
         )
         print("\033[91m=========================================\033[0m\n")
+    sys.exit(0 if passed else 1)
 
 
 if __name__ == "__main__":

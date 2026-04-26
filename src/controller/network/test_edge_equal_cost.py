@@ -1,3 +1,4 @@
+import sys
 import time
 import subprocess
 from mininet.net import Mininet
@@ -6,7 +7,7 @@ from mininet.log import setLogLevel, info
 
 
 def test_equal_cost_flapping():
-    """
+    r"""
     Edge Case: Equal-cost tie-breaking and symmetry during constant failure.
 
     Tests that traffic survives repeated path transitions between two
@@ -100,6 +101,7 @@ def test_equal_cost_flapping():
             f"\033[91m      FAIL (Initial: {loss_initial}%, TopDown: {loss_top_down}%, BotDown: {loss_bot_down}%, Part: {loss_part}%, Final: {loss_final}%) \033[0m"
         )
         print("\033[91m=========================================\033[0m\n")
+    sys.exit(0 if passed else 1)
 
 
 if __name__ == "__main__":

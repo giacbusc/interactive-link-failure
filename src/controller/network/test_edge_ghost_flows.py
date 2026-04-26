@@ -1,3 +1,4 @@
+import sys
 import time
 import subprocess
 from mininet.net import Mininet
@@ -6,7 +7,7 @@ from mininet.log import setLogLevel, info
 
 
 def test_ghost_flow_accumulation():
-    """
+    r"""
     Edge Case: Stale flow accumulation after repeated fail-recover cycles.
 
     Topology: Diamond with two equal-cost paths.
@@ -99,6 +100,7 @@ def test_ghost_flow_accumulation():
             f"AllCyclesOK: {all_passed}) \033[0m"
         )
         print("\033[91m=========================================\033[0m\n")
+    sys.exit(0 if passed else 1)
 
 
 if __name__ == "__main__":

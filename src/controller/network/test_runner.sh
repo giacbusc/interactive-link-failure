@@ -173,8 +173,8 @@ for ((i = 0; i < total; i++)); do
     # Stop the controller
     _stop_controller
     
-    # Track pass/fail from output
-    if grep -q "PASS" "$test_log"; then
+    # Track pass/fail from test process exit code
+    if [ "$rc" -eq 0 ]; then
         passed=$((passed + 1))
     else
         failed=$((failed + 1))

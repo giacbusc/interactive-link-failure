@@ -1,3 +1,4 @@
+import sys
 import time
 import subprocess
 from mininet.net import Mininet
@@ -95,6 +96,7 @@ def test_switch_death_and_rebirth():
             f"Rejoin: {loss_rejoined}%, Stable: {loss_stable}%) \033[0m"
         )
         print("\033[91m=========================================\033[0m\n")
+    sys.exit(0 if passed else 1)
 
 
 if __name__ == "__main__":

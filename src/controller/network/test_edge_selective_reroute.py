@@ -1,3 +1,4 @@
+import sys
 import time
 import subprocess
 from mininet.net import Mininet
@@ -6,7 +7,7 @@ from mininet.log import setLogLevel, info
 
 
 def test_selective_reroute_multi_pair():
-    """
+    r"""
     Edge Case: RouteTracker multi-pair isolation during link failure.
 
     Topology:
@@ -122,6 +123,7 @@ def test_selective_reroute_multi_pair():
             f"After23: {loss_23_after}%, Final: {loss_final}%) \033[0m"
         )
         print("\033[91m=========================================\033[0m\n")
+    sys.exit(0 if passed else 1)
 
 
 if __name__ == "__main__":

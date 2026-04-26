@@ -1,3 +1,4 @@
+import sys
 import time
 import subprocess
 from mininet.net import Mininet
@@ -86,6 +87,7 @@ def test_reconnect_race_recovery():
             f"AllRecoveriesOK: {all_recoveries_ok}) \033[0m"
         )
         print("\033[91m=========================================\033[0m\n")
+    sys.exit(0 if passed else 1)
 
 
 if __name__ == "__main__":

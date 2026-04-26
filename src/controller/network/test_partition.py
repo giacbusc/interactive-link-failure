@@ -1,3 +1,4 @@
+import sys
 import time
 import subprocess
 from mininet.net import Mininet
@@ -101,6 +102,7 @@ def test_partition():
             f"\033[91m      FAIL (Initial: {loss_initial}%, I1: {loss_i1}%, I2: {loss_i2}%, Cross: {loss_cross}%, Final: {loss_final}%) \033[0m"
         )
         print("\033[91m=========================================\033[0m\n")
+    sys.exit(0 if passed else 1)
 
 
 if __name__ == "__main__":

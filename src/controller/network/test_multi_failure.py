@@ -1,3 +1,4 @@
+import sys
 import time
 import subprocess
 from mininet.net import Mininet
@@ -6,7 +7,7 @@ from mininet.log import setLogLevel, info
 
 
 def test_multi_failure():
-    """
+    r"""
     Progressive multiple link failures in a full mesh.
 
     Tests routing behavior as links are progressively disabled until
@@ -102,6 +103,7 @@ def test_multi_failure():
             f"\033[91m      FAIL (Initial: {loss_initial}%, Fail1: {loss_first_fail}%, Iso: {loss_isolated}%, Frag: {loss_frag}%, Final: {loss_final}%) \033[0m"
         )
         print("\033[91m=========================================\033[0m\n")
+    sys.exit(0 if passed else 1)
 
 
 if __name__ == "__main__":

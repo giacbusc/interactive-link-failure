@@ -1,3 +1,4 @@
+import sys
 import time
 import subprocess
 from mininet.net import Mininet
@@ -6,7 +7,7 @@ from mininet.log import setLogLevel, info
 
 
 def test_link_restore_stale_path_cache():
-    """
+    r"""
     Edge Case: Stale path cache after link recovery causes broken routing.
 
     The path computer caches shortest paths. When a link goes DOWN,
@@ -123,6 +124,7 @@ def test_link_restore_stale_path_cache():
             f"FB:{loss_full_bottom}% ALL:{loss_all_restored}%) \033[0m"
         )
         print("\033[91m=========================================\033[0m\n")
+    sys.exit(0 if passed else 1)
 
 
 if __name__ == "__main__":

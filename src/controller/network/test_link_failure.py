@@ -1,3 +1,4 @@
+import sys
 import time
 import subprocess
 from mininet.net import Mininet
@@ -6,7 +7,7 @@ from mininet.log import setLogLevel, info
 
 
 def test_single_failure_recovery():
-    """
+    r"""
     Single link failure and recovery in a ring topology.
 
     Verifies that traffic reroutes through an alternate path when the
@@ -83,6 +84,7 @@ def test_single_failure_recovery():
             f"\033[91m      FAIL (Initial: {loss_initial}%, Loss1: {loss1}%, Loss2: {loss2}%) \033[0m"
         )
         print("\033[91m=========================================\033[0m\n")
+    sys.exit(0 if passed else 1)
 
 
 if __name__ == "__main__":
