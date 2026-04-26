@@ -1,7 +1,7 @@
 # SDN Controller — Lab Experience 2025/26
 
 SDN controller for a LAN (up to 4 hosts, arbitrary topology including rings) built
-with **[os-ken](https://github.com/osrg/os-ken)** (OpenFlow 1.3) and **NetworkX**.
+with **os-ken** (OpenFlow 1.3) and **NetworkX**.
 Two forwarding planes: **default** (shortest-path with link-failure recovery) and
 **policy** (user-pinned path, no recovery). A **FastAPI + uvicorn** REST API exposes
 topology, path, port-stats, and policy management endpoints.
