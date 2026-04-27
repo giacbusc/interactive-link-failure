@@ -147,7 +147,7 @@ UNSPECIFIED ──[POST /policy]──► POLICY_ACTIVE
 3. Removes the port from TopologyGraph (tears down any associated link).
 4. **If switch-to-switch link**: calls `ForwardingPlane.handle_link_failure()`
    to find and delete affected flows, then marks affected policy pairs BROKEN.
-5. Recomputs ST and refreshes flood rules.
+5. Recomputes ST and refreshes flood rules.
 
 ### Unicast packet-in (`EventOFPPacketIn`)
 
