@@ -96,7 +96,7 @@ class FlowInstaller:
             if len(path) == 1:
                 dp = self._datapaths.get(path[0])
                 if dp:
-                    out_port = self._find_edge_port(path[0], src_mac, dst_mac)
+                    out_port = self._find_edge_port(path[0], dst_mac)
                     if out_port is not None:
                         self._add_flow(dp, dst_mac, out_port, timeout, priority)
                         LOG.info(
@@ -124,7 +124,7 @@ class FlowInstaller:
 
             if i == len(path) - 1:
                 # ── Sink switch: output to edge port (host-facing) ──
-                out_port = self._find_edge_port(dpid, src_mac, dst_mac)
+                out_port = self._find_edge_port(dpid, dst_mac)
                 if out_port is not None:
                     self._add_flow(dp, dst_mac, out_port, timeout, priority)
                     LOG.info(
@@ -414,7 +414,7 @@ class FlowInstaller:
         )
         dp.send_msg(msg)
 
-    def _find_edge_port(self, dpid: int, src_mac: str, dst_mac: str) -> Optional[int]:
+    def _find_edge_port(self, dpid: int, dst_mac: str) -> Optional[int]:
         """Find the edge port on *dpid* for the destination host."""
         ht = self._host_tracker
         if ht is not None:

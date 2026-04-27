@@ -3,8 +3,8 @@
 Wires all modules together and delegates os-ken events to the appropriate handler.
 No business logic lives here.
 
-Do NOT run this file directly. Use ``run.py`` instead, which ensures
-eventlet.monkey_patch() is called before any other imports.
+Do NOT run this file directly. Use ``run.py`` instead, which calls
+eventlet.monkey_patch() early in the startup sequence.
 """
 
 from __future__ import annotations
@@ -359,7 +359,7 @@ class Backend(app_manager.OSKenApp):
     def _link_add_handler(self, ev) -> None:
         """Handle a newly discovered switch-to-switch link (LLDP).
 
-        Before adding the link, we clean any hosts that were wrongly learned
+        After adding the link, we clean any hosts that were wrongly learned
         on these ports.  During startup, all ports start as assumed-edge,
         and broadcast traffic can cause the host tracker to absorb source
         MACs on internal ports.  Once LLDP confirms these ports are

@@ -1,8 +1,9 @@
 #!/usr/bin/env python
 """Launcher for the SDN controller.
 
-Must be run directly (not imported) so that eventlet.monkey_patch()
-executes before any other module loads.
+Must be run directly (not imported).  eventlet.monkey_patch() is called
+after os-ken imports; if os-ken or its dependencies touch stdlib
+networking/threading before patching, subtle runtime issues may arise.
 
 Usage:
     python run.py

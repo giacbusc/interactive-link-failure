@@ -137,7 +137,11 @@ class StatsCollector:
         )
 
     def get_snapshot(self) -> dict[int, dict[int, PortStats]]:
-        """Return a deep copy of the current stats snapshot."""
+        """Return a snapshot of the current stats (shares ``PortStats`` references).
+
+        The outer dict structure is copied; ``PortStats`` objects themselves
+        are shared.  Consumers must treat them as read-only.
+        """
         # The RestAPI endpoint will format this.
         with self._lock:
             return {dpid: dict(ports) for dpid, ports in self._stats.items()}

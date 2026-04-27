@@ -49,8 +49,10 @@ class PolicyEntry:
     """Stored policy for a single (src_mac, dst_mac) pair.
 
     ``path`` is a list of ``LinkKey`` edges defining the pinned switch-to-switch
-    route.  It is never mutated in-place — replacements create a new
-    ``PolicyEntry``.
+    route.  The path list is never mutated in-place — replacements create
+    a new ``PolicyEntry``.  However, ``state`` may be mutated in-place by
+    ``mark_broken`` and ``mark_all_affected_broken`` to transition
+    POLICY_ACTIVE → POLICY_BROKEN without replacing the entry.
     """
 
     state: PolicyState = PolicyState.UNSPECIFIED

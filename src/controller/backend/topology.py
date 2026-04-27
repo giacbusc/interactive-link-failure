@@ -215,7 +215,7 @@ class TopologyGraph:
 
     @property
     def links(self) -> list[LinkKey]:
-        """Return all directed links currently in the graph."""
+        """Return one canonical link per undirected edge (smaller dpid first)."""
         with self._lock:
             result = []
             for u, v, data in self._graph.edges(data=True):
