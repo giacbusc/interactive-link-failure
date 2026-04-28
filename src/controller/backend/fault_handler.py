@@ -5,7 +5,6 @@ from __future__ import annotations
 import logging
 
 from topology import LinkKey, TopologyGraph, TopologyManager
-from spanning_tree import SpanningTreeManager
 from forwarding_plane import ForwardingPlane
 from flow_installer import FlowInstaller
 from policy_manager import PolicyManager
@@ -14,20 +13,22 @@ LOG = logging.getLogger(__name__)
 
 
 class FaultHandler:
-    """Handles link failures: updates graph, recomputes ST, removes affected flows."""
+    """Handles link failures: updates graph, removes affected flows.
+
+    Without spanning-tree flooding, only the graph and affected flows
+    need to be cleaned up on topology changes.
+    """
 
     def __init__(
         self,
         graph: TopologyGraph,
         topo_mgr: TopologyManager,
-        st_mgr: SpanningTreeManager,
         forwarding: ForwardingPlane,
         flow_installer: FlowInstaller,
         policy_mgr: PolicyManager,
     ) -> None:
         self.graph = graph
         self.topo_mgr = topo_mgr
-        self.st_mgr = st_mgr
         self.forwarding = forwarding
         self.flow_installer = flow_installer
         self.policy_mgr = policy_mgr
@@ -79,13 +80,12 @@ class FaultHandler:
                     port,
                     ", ".join(removed),
                 )
-                # Delete stale flows for each purged host on *every* switch.
-                # Without this, old flow entries would blackhole traffic
-                # toward the now-dead port.
                 for mac in removed:
                     for sw_dpid in self.graph.switches:
                         self.flow_installer.delete_flows_for_mac(sw_dpid, mac)
                     self.forwarding.route_tracker.purge_mac(mac)
+                    # Mark all policies involving this MAC as BROKEN
+                    self.policy_mgr.mark_all_for_mac_broken(mac)
 
         # ── Remove port from graph (also tears down any associated link)
         self.graph.remove_port(dpid, port)
@@ -94,8 +94,6 @@ class FaultHandler:
             self.forwarding.handle_link_failure(link)
             self.policy_mgr.mark_all_affected_broken(link)
 
-        # Recompute spanning tree and update flood rules
-        self._refresh_flood_topology()
         LOG.info("FaultHandler: recovery complete for dpid=%s port=%d", hex(dpid), port)
 
     def handle_link_down(self, link: LinkKey) -> None:
@@ -111,7 +109,6 @@ class FaultHandler:
         self.graph.remove_link(link)
         self.forwarding.handle_link_failure(link)
         self.policy_mgr.mark_all_affected_broken(link)
-        self._refresh_flood_topology()
 
         LOG.info(
             "FaultHandler: recovery complete for link %s:%d → %s:%d",
@@ -119,18 +116,4 @@ class FaultHandler:
             link.src_port,
             hex(link.dst_dpid),
             link.dst_port,
-        )
-
-    def _refresh_flood_topology(self) -> None:
-        """Recompute ST and replace flood rules on all switches (preserves unicast flows)."""
-        LOG.info("FaultHandler: refreshing flood topology")
-        self.st_mgr.compute()
-        for dpid in self.graph.switches:
-            flood_ports = self.st_mgr.flood_ports(dpid)
-            self.flow_installer.delete_flood_rule(dpid)
-            if flood_ports:
-                self.flow_installer.install_flood_rules(dpid, flood_ports)
-        LOG.info(
-            "FaultHandler: flood topology refreshed for %d switches",
-            len(self.graph.switches),
         )

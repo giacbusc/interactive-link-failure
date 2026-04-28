@@ -25,7 +25,6 @@ from host_tracker import HostTracker
 from path_computer import PathComputer
 from route_tracker import RouteTracker
 from policy_manager import PolicyManager, PolicyState
-from spanning_tree import SpanningTreeManager
 
 LOG = logging.getLogger(__name__)
 
@@ -92,7 +91,6 @@ class RestAPI:
         route_tracker: RouteTracker,
         policy_mgr: PolicyManager,
         stats_collector: "StatsCollector",
-        spanning_tree: SpanningTreeManager,
     ) -> None:
         """Store references to all controller modules.
 
@@ -106,7 +104,6 @@ class RestAPI:
         self._route_tracker = route_tracker
         self._policy_mgr = policy_mgr
         self._stats_collector = stats_collector
-        self._spanning_tree = spanning_tree
 
         self._app: Optional["FastAPI"] = None
         self._server: Any = None
@@ -416,39 +413,13 @@ class RestAPI:
                 for lk in raw_links
             ]
 
-            hosts_snapshot = api._host_tracker.hosts
-            hosts = [
-                {"mac": mac, "dpid": loc.dpid, "port": loc.port}
-                for mac, loc in hosts_snapshot.items()
-            ]
-
-            tree_edges = api._spanning_tree.tree_edges
-            seen: set[tuple[int, int]] = set()
-            st_links = []
-            st_directed = list(tree_edges)
-            for u, v in st_directed:
-                canon = (u, v) if u < v else (v, u)
-                if canon in seen:
-                    continue
-                seen.add(canon)
-                port_u = api._graph.get_port_for_peer(u, v)
-                port_v = api._graph.get_port_for_peer(v, u)
-                if port_u is not None and port_v is not None:
-                    st_links.append(
-                        {
-                            "src_dpid": u,
-                            "src_port": port_u,
-                            "dst_dpid": v,
-                            "dst_port": port_v,
-                        }
-                    )
+            hosts = api._host_tracker.get_all_hosts()
 
             return JSONResponse(
                 content={
                     "switches": switches,
                     "links": links,
                     "hosts": hosts,
-                    "spanning_tree": st_links,
                 }
             )
 

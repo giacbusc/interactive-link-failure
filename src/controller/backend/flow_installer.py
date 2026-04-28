@@ -19,12 +19,10 @@ LOG = logging.getLogger(__name__)
 # Default idle timeout for regular (non-policy) flows in seconds.
 DEFAULT_IDLE_TIMEOUT = 30
 # Table 0 priority levels
+PRIORITY_DROP_IPV6 = 50
+PRIORITY_DROP_IPV4_MCAST = 40
 PRIORITY_POLICY = 20
 PRIORITY_DEFAULT = 10
-PRIORITY_FLOOD = 1
-# Cookie mask for identifying flood rules
-FLOOD_COOKIE_BASE = 0xF100D00000000000
-FLOOD_COOKIE_MASK = 0xFFFF000000000000
 
 
 class FlowInstaller:
@@ -62,6 +60,46 @@ class FlowInstaller:
         """Return the Datapath handle for *dpid*, or None if not connected."""
         return self._datapaths.get(dpid)
 
+    # ── Baseline drop rules ──────────────────────────────────────────────
+
+    def install_drop_rules(self, dp: Datapath) -> None:
+        """Install high-priority drop rules for IPv6 and IPv4 Multicast.
+
+        These are permanent (idle_timeout=0) and must be installed once per
+        switch connection.
+        """
+        ofp_parser = dp.ofproto_parser
+
+        # Drop all IPv6 (EtherType 0x86DD)
+        match_ipv6 = ofp_parser.OFPMatch(eth_type=0x86DD)
+        insts = []  # empty instructions = drop
+        self._send_flow_mod(
+            dp,
+            match=match_ipv6,
+            instructions=insts,
+            priority=PRIORITY_DROP_IPV6,
+            idle_timeout=0,
+            hard_timeout=0,
+        )
+        LOG.info("FlowInstaller: installed IPv6 DROP on dpid=%s", hex(dp.id))
+
+        # Drop IPv4 Multicast (EtherType 0x0800 + Dst MAC 01:00:5E:xx:xx:xx/24)
+        # The match: eth_type=0x0800 AND eth_dst matches 01:00:5e:*:*:*
+        match_mcast = ofp_parser.OFPMatch(
+            eth_type=0x0800,
+            eth_dst=("01:00:5e:00:00:00", "ff:ff:ff:80:00:00"),
+        )
+        insts_mcast = []
+        self._send_flow_mod(
+            dp,
+            match=match_mcast,
+            instructions=insts_mcast,
+            priority=PRIORITY_DROP_IPV4_MCAST,
+            idle_timeout=0,
+            hard_timeout=0,
+        )
+        LOG.info("FlowInstaller: installed IPv4 Multicast DROP on dpid=%s", hex(dp.id))
+
     # ── Install a unicast path (sink → source) ──────────────────────────
 
     def install_path(
@@ -71,13 +109,6 @@ class FlowInstaller:
 
         Installs sink-to-source (last switch first). Returns the list of
         LinkKey objects traversed, for RouteTracker.
-
-        Why sink-to-source?  If we install source→sink and the controller
-        or switch crashes mid-installation, the first few switches already
-        forward traffic into a path where downstream switches have no flows
-        yet — packets are dropped.  Installing sink→source means the packet
-        is delivered as soon as the last hop is installed, and intermediate
-        packet-in events handle the rest safely.
         """
         timeout = 0 if is_policy else DEFAULT_IDLE_TIMEOUT
         priority = PRIORITY_POLICY if is_policy else PRIORITY_DEFAULT
@@ -110,8 +141,6 @@ class FlowInstaller:
         links: list[LinkKey] = []
 
         # ── Walk the path backwards: sink → … → source ─────────────────
-        # For path [s1, s2, s3]: process s3 (sink), then s2 (mid), then
-        # handle s1 (source) after the loop.
         for i in range(len(path) - 1, 0, -1):
             dpid = path[i]
             dp = self._datapaths.get(dpid)
@@ -128,7 +157,7 @@ class FlowInstaller:
                 if out_port is not None:
                     self._add_flow(dp, dst_mac, out_port, timeout, priority)
                     LOG.info(
-                        "FlowInstaller:   [sink] dpid=%s eth_dst=%s → port=%d (edge)",
+                        "FlowInstaller:   [sink] dpid=%s eth_dst=%s port=%d (edge)",
                         hex(dpid),
                         dst_mac,
                         out_port,
@@ -146,7 +175,7 @@ class FlowInstaller:
                 if out_port is not None:
                     self._add_flow(dp, dst_mac, out_port, timeout, priority)
                     LOG.info(
-                        "FlowInstaller:   [mid]  dpid=%s eth_dst=%s → port=%d (→ %s)",
+                        "FlowInstaller:   [mid]  dpid=%s eth_dst=%s port=%d (→ %s)",
                         hex(dpid),
                         dst_mac,
                         out_port,
@@ -154,8 +183,6 @@ class FlowInstaller:
                     )
 
             # ── Build LinkKey for RouteTracker ──
-            # Sink switch has no next-hop link to record (it is the endpoint).
-            # Intermediate switches record the link to their successor.
             if i >= len(path) - 1:
                 continue
             next_dpid = path[i + 1]
@@ -179,7 +206,7 @@ class FlowInstaller:
         if dp and out_port is not None:
             self._add_flow(dp, dst_mac, out_port, timeout, priority)
             LOG.info(
-                "FlowInstaller:   [src]  dpid=%s eth_dst=%s → port=%d (→ %s)",
+                "FlowInstaller:   [src]  dpid=%s eth_dst=%s port=%d (→ %s)",
                 hex(src_dpid),
                 dst_mac,
                 out_port,
@@ -204,68 +231,6 @@ class FlowInstaller:
             dst_mac,
         )
         return links
-
-    # ── Flood rules ─────────────────────────────────────────────────────
-
-    def install_flood_rules(self, dpid: int, flood_ports: set[int]) -> None:
-        """Install a low-priority rule that floods broadcast traffic to *flood_ports*.
-
-        Matches eth_dst=ff:ff:ff:ff:ff:ff so that only broadcast packets (ARP,
-        DHCP, etc.) are flooded.  Unicast packets fall through to the table-miss
-        rule and are sent to the controller for path computation.
-        """
-        dp = self._datapaths.get(dpid)
-        if dp is None or not flood_ports:
-            return
-
-        # Delete any existing flood rule first (idempotent reinstall)
-        self.delete_flood_rule(dpid)
-
-        ofp_parser = dp.ofproto_parser
-
-        # Single rule matching broadcast destination — no per-input-port rules.
-        # This avoids the in_port-only match bug that would intercept unicast
-        # traffic before the table-miss rule gets a chance to send it to the
-        # controller.
-        match = ofp_parser.OFPMatch(eth_dst="ff:ff:ff:ff:ff:ff")
-        actions = [ofp_parser.OFPActionOutput(port) for port in sorted(flood_ports)]
-
-        self._send_flow_mod(
-            dp,
-            match=match,
-            actions=actions,
-            priority=PRIORITY_FLOOD,
-            idle_timeout=0,
-            hard_timeout=0,
-            cookie=FLOOD_COOKIE_BASE | (dpid & 0xFFFF),
-        )
-
-        LOG.info(
-            "FlowInstaller: flood rule dpid=%s → ports=%s",
-            hex(dpid),
-            sorted(flood_ports),
-        )
-
-    def delete_flood_rule(self, dpid: int) -> None:
-        """Delete the flood rule on a switch (cookie-based, preserves unicast flows)."""
-        dp = self._datapaths.get(dpid)
-        if dp is None:
-            return
-        ofp = dp.ofproto
-        ofp_parser = dp.ofproto_parser
-        match = ofp_parser.OFPMatch(eth_dst="ff:ff:ff:ff:ff:ff")
-        msg = ofp_parser.OFPFlowMod(
-            datapath=dp,
-            cookie=FLOOD_COOKIE_BASE | (dpid & 0xFFFF),
-            cookie_mask=FLOOD_COOKIE_MASK,
-            command=ofp.OFPFC_DELETE,
-            table_id=ofp.OFPTT_ALL,
-            out_port=ofp.OFPP_ANY,
-            out_group=ofp.OFPG_ANY,
-            match=match,
-        )
-        dp.send_msg(msg)
-        LOG.debug("FlowInstaller: deleted flood rule dpid=%s", hex(dpid))
 
     # ── Flow deletion ───────────────────────────────────────────────────
 
@@ -329,41 +294,6 @@ class FlowInstaller:
             out_port,
         )
 
-    def flood_packet_out(
-        self,
-        dp: Datapath,
-        in_port: int,
-        flood_ports: set[int],
-        data: bytes,
-        buffer_id: int,
-    ) -> None:
-        """Send a packet out a set of ports (broadcast flooding)."""
-        ofp = dp.ofproto
-        ofp_parser = dp.ofproto_parser
-        ports = flood_ports - {in_port}
-        if not ports:
-            LOG.debug(
-                "FlowInstaller: flood packet-out dpid=%s in=%d → NO PORTS",
-                hex(dp.id),
-                in_port,
-            )
-            return
-        actions = [ofp_parser.OFPActionOutput(p) for p in sorted(ports)]
-        out = ofp_parser.OFPPacketOut(
-            datapath=dp,
-            buffer_id=buffer_id,
-            in_port=in_port,
-            actions=actions,
-            data=data if buffer_id == ofp.OFP_NO_BUFFER else None,
-        )
-        dp.send_msg(out)
-        LOG.debug(
-            "FlowInstaller: flood packet-out dpid=%s in=%d → ports=%s",
-            hex(dp.id),
-            in_port,
-            sorted(ports),
-        )
-
     # ── Internal helpers ────────────────────────────────────────────────
 
     def _add_flow(
@@ -392,21 +322,32 @@ class FlowInstaller:
         dp: Datapath,
         *,
         match,
-        actions,
+        instructions=None,
+        actions=None,
         priority: int,
         idle_timeout: int,
         hard_timeout: int,
         cookie: int = 0,
     ) -> None:
-        """Build and send a single OFPFlowMod message to *dp*."""
+        """Build and send a single OFPFlowMod message to *dp*.
+
+        If *instructions* is None and *actions* is provided, builds
+        OFPInstructionActions.  If both are None, the flow drops.
+        """
         ofp = dp.ofproto
         ofp_parser = dp.ofproto_parser
-        inst = [ofp_parser.OFPInstructionActions(ofp.OFPIT_APPLY_ACTIONS, actions)]
+        if instructions is None:
+            if actions:
+                instructions = [
+                    ofp_parser.OFPInstructionActions(ofp.OFPIT_APPLY_ACTIONS, actions)
+                ]
+            else:
+                instructions = []
         msg = ofp_parser.OFPFlowMod(
             datapath=dp,
             cookie=cookie,
             match=match,
-            instructions=inst,
+            instructions=instructions,
             priority=priority,
             idle_timeout=idle_timeout,
             hard_timeout=hard_timeout,
@@ -420,12 +361,6 @@ class FlowInstaller:
         if ht is not None:
             loc = ht.lookup(dst_mac)
             if loc and loc.dpid == dpid:
-                LOG.debug(
-                    "FlowInstaller: edge port for %s on dpid=%s → port=%d (from tracker)",
-                    dst_mac,
-                    hex(dpid),
-                    loc.port,
-                )
                 return loc.port
         LOG.warning(
             "FlowInstaller: no edge port found for %s on dpid=%s", dst_mac, hex(dpid)

@@ -21,6 +21,10 @@ class ForwardingPlane:
     Checks ``PolicyManager`` first: if a user-pinned path exists for the
     pair, it is installed with high priority and no idle timeout. Otherwise
     the default shortest-path is used.
+
+    Host learning and mobility detection are handled by os-ken's built-in
+    host discovery (EventHostAdd / EventHostMove).  This module only
+    queries the HostTracker for current locations.
     """
 
     def __init__(
@@ -44,7 +48,8 @@ class ForwardingPlane:
     ) -> bool:
         """Handle a packet-in for unicast forwarding.
 
-        Returns True if a path was installed, False if unreachable or unknown dst.
+        Returns True if a path was installed, False if destination is unknown.
+        The caller should drop the packet when False is returned.
         """
         LOG.info(
             "Forwarding: packet-in %s → %s on dpid=%s port=%d",
@@ -54,29 +59,16 @@ class ForwardingPlane:
             in_port,
         )
 
-        # Learn source location — returns previous location if host moved
-        old_loc = self.host_tracker.learn(src_mac, in_dpid, in_port)
-        if old_loc is not None:
-            # Host moved: purge stale flows on the old switch and clean
-            # route tracker entries that involved this host from the old
-            # location.  New flows will be installed below.
-            LOG.info(
-                "Forwarding: %s moved from dpid=%s → dpid=%s — cleaning old flows",
-                src_mac,
-                hex(old_loc.dpid),
-                hex(in_dpid),
-            )
-            self.flow_installer.delete_flows_for_mac(old_loc.dpid, src_mac)
-            self.route_tracker.purge_mac(src_mac)
-            self.path_computer.invalidate_pair(old_loc.dpid, in_dpid)
-
-        # Lookup destination
+        # os-ken has already learned the source host from this packet
+        # (via its built-in host_discovery_packet_in_handler).
+        # We just query the current location.
+        src_loc = self.host_tracker.lookup(src_mac)
         dst_loc = self.host_tracker.lookup(dst_mac)
+
         if dst_loc is None:
-            LOG.info("Forwarding: dst %s UNKNOWN — will flood (ARP?)", dst_mac)
+            LOG.info("Forwarding: dst %s UNKNOWN — dropping", dst_mac)
             return False
 
-        src_loc = self.host_tracker.lookup(src_mac)
         src_dpid = src_loc.dpid if src_loc else in_dpid
         dst_dpid = dst_loc.dpid
 
@@ -87,7 +79,7 @@ class ForwardingPlane:
         if in_dpid != src_dpid:
             LOG.debug(
                 "Forwarding: packet-in at dpid=%s but source %s lives on dpid=%s "
-                "— skipping path install (existing flows or flood will deliver)",
+                "— skipping path install (existing flows or timeout will deliver)",
                 hex(in_dpid),
                 src_mac,
                 hex(src_dpid),
@@ -169,12 +161,6 @@ class ForwardingPlane:
         if path is None or len(path) < 2:
             return None
         port = self.flow_installer.graph.get_port_for_peer(path[0], path[1])
-        LOG.debug(
-            "Forwarding: output_port %s → %s = port %d",
-            hex(src_dpid),
-            hex(dst_dpid),
-            port if port else -1,
-        )
         return port
 
     def handle_link_failure(self, link: LinkKey) -> list[tuple[str, str]]:
@@ -182,14 +168,12 @@ class ForwardingPlane:
 
         The recovery strategy:
         1. Query RouteTracker for every (src_mac, dst_mac) pair whose path
-           traverses the failed link (using the undirected key, which matches
-           regardless of link direction).
+           traverses the failed link.
         2. For each affected pair, delete both src_mac and dst_mac flows on
            every switch that was on the old path.
         3. Remove the pair from RouteTracker so a new path is computed on the
            next packet-in.
-        4. Invalidate the entire path cache since any cached path may now be
-           invalid after the topology change.
+        4. Invalidate the entire path cache.
         """
         LOG.warning(
             "Forwarding: link failure %s:%d → %s:%d — finding affected flows",
@@ -211,9 +195,6 @@ class ForwardingPlane:
             for lk in pair_links:
                 dpids_to_clean.add(lk.src_dpid)
                 dpids_to_clean.add(lk.dst_dpid)
-            # Delete flows matching both MACs on every switch that carried
-            # this pair's traffic.  ``delete_flows_for_mac`` is idempotent
-            # — if the flows already timed out, the delete is a safe no-op.
             for dpid in dpids_to_clean:
                 self.flow_installer.delete_flows_for_mac(dpid, dst_mac)
                 self.flow_installer.delete_flows_for_mac(dpid, src_mac)

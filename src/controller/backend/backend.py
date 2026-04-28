@@ -23,11 +23,11 @@ from os_ken.controller.handler import (
 )
 from os_ken.controller.controller import Datapath
 from os_ken.ofproto import ofproto_v1_3
-from os_ken.lib.packet import ethernet, packet
+from os_ken.lib.packet import arp as arp_packet
+from os_ken.lib.packet import ethernet, ipv4, packet
 from os_ken.topology import event as topo_event
 
 from topology import TopologyGraph, TopologyManager, LinkKey
-from spanning_tree import SpanningTreeManager
 from host_tracker import HostTracker
 from path_computer import PathComputer
 from route_tracker import RouteTracker
@@ -56,8 +56,7 @@ class Backend(app_manager.OSKenApp):
 
         self.graph = TopologyGraph()
         self.topo_mgr = TopologyManager(self.graph)
-        self.st_mgr = SpanningTreeManager(self.graph)
-        self.host_tracker = HostTracker(self.graph)
+        self.host_tracker = HostTracker()
         self.path_computer = PathComputer(self.graph)
         self.route_tracker = RouteTracker()
         self.flow_installer = FlowInstaller(self.graph)
@@ -79,7 +78,6 @@ class Backend(app_manager.OSKenApp):
         self.fault_handler = FaultHandler(
             self.graph,
             self.topo_mgr,
-            self.st_mgr,
             self.forwarding,
             self.flow_installer,
             self.policy_mgr,
@@ -99,7 +97,6 @@ class Backend(app_manager.OSKenApp):
             route_tracker=self.route_tracker,
             policy_mgr=self.policy_mgr,
             stats_collector=self.stats_collector,
-            spanning_tree=self.st_mgr,
         )
 
         # Track which switches have had their ports registered.
@@ -115,7 +112,7 @@ class Backend(app_manager.OSKenApp):
 
     @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
     def _switch_features_handler(self, ev) -> None:
-        """Called when a switch connects. Install table-miss and register switch."""
+        """Called when a switch connects. Install baseline rules and register switch."""
         dp = ev.msg.datapath
         LOG.info(">>> SWITCH CONNECTED dpid=%s | features received", hex(dp.id))
 
@@ -127,6 +124,9 @@ class Backend(app_manager.OSKenApp):
         self._try_init_ports(dp)
 
         self._install_table_miss(dp)
+        self.flow_installer.install_drop_rules(dp)
+        # Invalidate path cache — topology may have changed while disconnected
+        self.path_computer.invalidate()
         LOG.info("<<< SWITCH REGISTERED dpid=%s", hex(dp.id))
 
     @set_ev_cls(
@@ -140,9 +140,7 @@ class Backend(app_manager.OSKenApp):
             return
         dpid = dp.id
 
-        # Guard against stale disconnect events: when a switch reconnects,
-        # os-ken creates a new Datapath and the old one fires a DEAD event.
-        # If a newer connection already replaced this dp, skip the cleanup.
+        # Guard against stale disconnect events
         current_dp = self.flow_installer.get_dp(dpid)
         if current_dp is not None and current_dp is not dp:
             LOG.debug(
@@ -155,10 +153,7 @@ class Backend(app_manager.OSKenApp):
 
         self.flow_installer.unregister_dp(dpid)
 
-        # Purge routes that involved this switch and delete orphaned
-        # flows on surviving switches. Port-status events handle the
-        # directly-connected links; this catches anything further
-        # upstream (e.g., flows on s1 for path s1→s2→s3 when s2 dies).
+        # Purge routes that involved this switch and delete orphaned flows
         purged = self.route_tracker.purge_switch(dpid)
         for src_mac, dst_mac in purged:
             for surviving_dpid in self.graph.switches:
@@ -179,12 +174,13 @@ class Backend(app_manager.OSKenApp):
                 len(removed_hosts),
                 ", ".join(removed_hosts),
             )
+            # Mark all policies involving purged hosts as BROKEN
+            for mac in removed_hosts:
+                self.policy_mgr.mark_all_for_mac_broken(mac)
 
         self.topo_mgr.switch_leave(dp)
         self._ports_initialized.discard(dpid)
         self.path_computer.invalidate()
-        self.st_mgr.compute()
-        self._install_all_flood_rules()
         LOG.info(
             "<<< Switch dpid=%s removed | purged %d routes, %d hosts",
             hex(dpid),
@@ -215,8 +211,6 @@ class Backend(app_manager.OSKenApp):
         elif reason == ofp.OFPPR_ADD:
             LOG.info(">>> PORT ADDED dpid=%s port=%d", hex(dp.id), port_no)
             self.topo_mgr.port_add(dp, port_no)
-            self.st_mgr.compute()
-            self._install_all_flood_rules()
         elif reason == ofp.OFPPR_MODIFY:
             is_down = bool(ev.msg.desc.state & ofp.OFPPS_LINK_DOWN)
             LOG.info(
@@ -226,14 +220,9 @@ class Backend(app_manager.OSKenApp):
                 "DOWN" if is_down else "UP",
             )
             if is_down:
-                # Resolve the link BEFORE port_modify removes it from the graph.
-                # handle_port_down needs to know which link failed so it can
-                # delete affected flows from the switches.
                 self.fault_handler.handle_port_down(dp.id, port_no)
             else:
                 self.topo_mgr.port_modify(dp, port_no, is_down)
-                self.st_mgr.compute()
-                self._install_all_flood_rules()
         else:
             LOG.debug(
                 "PortStatus: unknown reason=%d dpid=%s port=%d",
@@ -250,36 +239,28 @@ class Backend(app_manager.OSKenApp):
 
         Three code paths:
 
-        1. **Broadcast/multicast** — flooded on spanning-tree ports only.
-           The source MAC is NOT learned here (broadcasts don't carry
-           reliable location info — they may arrive via internal ports).
+        1. **ARP Request** → Proxy ARP (answer directly if target is known,
+           silently drop otherwise).
 
-        2. **Unicast, path installed** — try to forward the buffered
-           packet out the correct port.  If the output port can't be
-           determined, fall back to flooding.
+        2. **ARP Reply / Gratuitous ARP** → Learn IPs, drop silently
+           (os-ken already handled MAC learning).
 
-        3. **Unicast, path NOT installed** (unknown/unreachable dst) —
-           flood the packet so it reaches the destination (e.g., first
-           ARP request for an unknown host).
+        3. **IPv4 Unicast** → Reactive forwarding (install path and forward
+           if destination is known, drop otherwise).
+
+        4. **Anything else** → Drop silently (default deny / zero-trust).
         """
         msg = ev.msg
         dp = msg.datapath
         dpid = dp.id
         in_port = msg.match["in_port"]
 
-        # Lazily initialize ports on first packet-in. By this point
-        # os-ken's switches app has already populated dp.ports via
-        # EventOFPPortDescStatsReply.
+        # Lazily initialize ports on first packet-in.
         self._try_init_ports(dp)
 
         pkt = packet.Packet(msg.data)
         eth = pkt.get_protocol(ethernet.ethernet)
         if eth is None:
-            LOG.debug(
-                "PacketIn: non-ethernet packet on dpid=%s port=%d — ignoring",
-                hex(dpid),
-                in_port,
-            )
             return
 
         src_mac = eth.src
@@ -289,26 +270,45 @@ class Backend(app_manager.OSKenApp):
         if dst_mac == LLDP_MAC:
             return
 
-        # ── Path 1: broadcast / multicast → flood on spanning tree ────
-        # Check the multicast bit: least significant bit of the FIRST
-        # octet of the destination MAC.  Exclude in_port so the packet
-        # isn't sent back where it came from.
+        # ── ARP processing ───────────────────────────────────────────
+        arp = pkt.get_protocol(arp_packet.arp)
+        if arp is not None:
+            # Learn source IP: arp.src_ip belongs to eth.src (the sender)
+            if arp.src_ip and arp.src_ip != "0.0.0.0":
+                self.host_tracker.add_ip(src_mac, arp.src_ip)
+
+            if arp.opcode == arp_packet.ARP_REPLY:
+                # In ARP Reply, arp.dst_ip is the original requester's IP
+                # and eth.dst is the requester's MAC — learn this association.
+                if arp.dst_ip and arp.dst_ip != "0.0.0.0":
+                    self.host_tracker.add_ip(dst_mac, arp.dst_ip)
+            elif arp.opcode == arp_packet.ARP_REQUEST:
+                # Skip gratuitous ARP (src_ip == dst_ip) — already learned above
+                if arp.src_ip == arp.dst_ip:
+                    return
+                self._handle_arp_request(dp, in_port, msg.data, msg.buffer_id, arp, eth)
+            return
+
+        # ── IPv4 unicast (reactive forwarding) ────────────────────────
+        ip_pkt = pkt.get_protocol(ipv4.ipv4)
+        if ip_pkt is not None:
+            # Learn source IP from IPv4 packet
+            if ip_pkt.src and ip_pkt.src != "0.0.0.0":
+                self.host_tracker.add_ip(src_mac, ip_pkt.src)
+
+        # ── Path 1: broadcast / multicast → drop (zero-trust) ─────────
+        # The only exception is handled above (ARP processing).
+        # All other broadcast/multicast traffic is silently destroyed.
         if dst_mac == "ff:ff:ff:ff:ff:ff" or int(dst_mac[:2], 16) & 1:
-            flood_ports = self.st_mgr.flood_ports(dpid) - {in_port}
             LOG.debug(
-                "PacketIn: BROADCAST %s → %s on dpid=%s port=%d → flood ports=%s",
+                "PacketIn: broadcast/multicast %s → %s on dpid=%s — dropping (zero-trust)",
                 src_mac,
                 dst_mac,
                 hex(dpid),
-                in_port,
-                sorted(flood_ports),
-            )
-            self.flow_installer.flood_packet_out(
-                dp, in_port, flood_ports, msg.data, msg.buffer_id
             )
             return
 
-        # ── Path 2 / 3: unicast ───────────────────────────────────────
+        # ── Path 2 / 3: unicast forwarding ────────────────────────────
         LOG.info(
             "PacketIn: UNICAST %s → %s on dpid=%s port=%d",
             src_mac,
@@ -319,7 +319,6 @@ class Backend(app_manager.OSKenApp):
         installed = self.forwarding.handle_packet(src_mac, dst_mac, dpid, in_port)
 
         if installed:
-            # ── Path 2: path installed → forward the buffered packet ──
             dst_loc = self.host_tracker.lookup(dst_mac)
             if dst_loc:
                 out_port = self.forwarding.get_output_port(dpid, dst_loc.dpid)
@@ -334,24 +333,157 @@ class Backend(app_manager.OSKenApp):
                         dp, msg.data, msg.buffer_id, in_port, out_port
                     )
                     return
-            # If we couldn't determine the output port, flood instead
             LOG.warning(
-                "PacketIn: path installed but couldn't find output port — flooding"
-            )
-            flood_ports = self.st_mgr.flood_ports(dpid) - {in_port}
-            self.flow_installer.flood_packet_out(
-                dp, in_port, flood_ports, msg.data, msg.buffer_id
+                "PacketIn: path installed but couldn't find output port — dropping"
             )
         else:
-            # ── Path 3: unknown/unreachable dst → flood ───────────────
             LOG.info(
-                "PacketIn: path NOT installed (unknown/unreachable dst %s) — flooding",
+                "PacketIn: path NOT installed for %s → %s (unknown dst) — dropping",
+                src_mac,
                 dst_mac,
             )
-            flood_ports = self.st_mgr.flood_ports(dpid) - {in_port}
-            self.flow_installer.flood_packet_out(
-                dp, in_port, flood_ports, msg.data, msg.buffer_id
+
+    # ── Proxy ARP ────────────────────────────────────────────────────
+
+    def _handle_arp_request(
+        self,
+        dp: Datapath,
+        in_port: int,
+        data: bytes,
+        buffer_id: int,
+        arp: any,
+        eth: any,
+    ) -> None:
+        """Handle an ARP Request: reply on behalf of known hosts.
+
+        If the target IP is known, craft an ARP Reply and send it to the
+        requester.  If unknown, drop silently (zero-trust).
+        """
+        target_ip = arp.dst_ip
+        src_ip = arp.src_ip
+        src_mac = arp.src_mac
+
+        LOG.info(
+            "ARP Request: %s (%s) asks for %s on dpid=%s port=%d",
+            src_ip,
+            src_mac,
+            target_ip,
+            hex(dp.id),
+            in_port,
+        )
+
+        # Look up the target in our host table
+        result = self.host_tracker.lookup_by_ip(target_ip)
+        if result is None:
+            LOG.info("ARP Request: target %s UNKNOWN — dropping", target_ip)
+            return
+
+        target_mac, target_dpid, target_port = result
+        LOG.info(
+            "ARP Request: target %s → %s (dpid=%s port=%d) — proxying reply",
+            target_ip,
+            target_mac,
+            hex(target_dpid),
+            target_port,
+        )
+
+        # Craft ARP Reply
+        reply_ether = ethernet.ethernet(
+            dst=src_mac,
+            src=target_mac,
+            ethertype=eth.ethertype,
+        )
+        reply_arp = arp_packet.arp(
+            opcode=arp_packet.ARP_REPLY,
+            src_mac=target_mac,
+            src_ip=target_ip,
+            dst_mac=src_mac,
+            dst_ip=src_ip,
+        )
+        reply_pkt = packet.Packet()
+        reply_pkt.add_protocol(reply_ether)
+        reply_pkt.add_protocol(reply_arp)
+        reply_pkt.serialize()
+
+        # Send the ARP Reply back to the requester
+        ofp = dp.ofproto
+        ofp_parser = dp.ofproto_parser
+        actions = [ofp_parser.OFPActionOutput(in_port)]
+        out = ofp_parser.OFPPacketOut(
+            datapath=dp,
+            buffer_id=ofp.OFP_NO_BUFFER,
+            in_port=ofp.OFPP_CONTROLLER,
+            actions=actions,
+            data=reply_pkt.data,
+        )
+        dp.send_msg(out)
+        LOG.info("ARP Reply: sent %s is at %s to %s", target_ip, target_mac, src_mac)
+
+    # ── Host discovery events (from os-ken) ──────────────────────────
+
+    @set_ev_cls(topo_event.EventHostAdd)
+    def _host_add_handler(self, ev) -> None:
+        """os-ken discovered a new host. Record its location."""
+        host = ev.host
+        dpid = host.port.dpid
+        port_no = host.port.port_no
+        LOG.info(
+            ">>> HOST ADD %s → dpid=%s port=%d",
+            host.mac,
+            hex(dpid),
+            port_no,
+        )
+        self.host_tracker.add_host(host.mac, dpid, port_no)
+
+    @set_ev_cls(topo_event.EventHostMove)
+    def _host_move_handler(self, ev) -> None:
+        """os-ken detected a host moving to a new port."""
+        old_host = ev.src
+        new_host = ev.dst
+        old_dpid = old_host.port.dpid
+        old_port = old_host.port.port_no
+        new_dpid = new_host.port.dpid
+        new_port = new_host.port.port_no
+
+        LOG.warning(
+            ">>> HOST MOVE %s: dpid=%s:%d → dpid=%s:%d",
+            old_host.mac,
+            hex(old_dpid),
+            old_port,
+            hex(new_dpid),
+            new_port,
+        )
+
+        # Update our host tracker
+        self.host_tracker.add_host(new_host.mac, new_dpid, new_port)
+
+        # Purge route tracker entries and clean flows in BOTH directions
+        purged = self.route_tracker.purge_mac(new_host.mac)
+        dpids = self.graph.switches
+        for pair in purged:
+            for dpid in dpids:
+                self.flow_installer.delete_flows_for_mac(dpid, pair[0])
+                self.flow_installer.delete_flows_for_mac(dpid, pair[1])
+            self.policy_mgr.mark_broken(pair[0], pair[1])
+
+        # Also delete any stale flows targeting the moved host's MAC
+        # (catches flows not tracked by route_tracker, e.g. same-switch)
+        for dpid in dpids:
+            self.flow_installer.delete_flows_for_mac(dpid, new_host.mac)
+
+        # Also mark policies involving the moved MAC as broken
+        broken_pairs = self.policy_mgr.mark_all_for_mac_broken(new_host.mac)
+        for src_mac, dst_mac in broken_pairs:
+            LOG.info(
+                "HOST MOVE: policy %s → %s → BROKEN",
+                src_mac,
+                dst_mac,
             )
+
+        # Invalidate path cache — a host move can affect many cached paths
+        self.path_computer.invalidate()
+
+        LOG.info("<<< HOST MOVE %s: stale flows cleaned", new_host.mac)
 
     # ── Topology events (from os-ken LLDP) ───────────────────────────
 
@@ -401,9 +533,7 @@ class Backend(app_manager.OSKenApp):
             )
 
         self.path_computer.invalidate()
-        self.st_mgr.compute()
-        self._install_all_flood_rules()
-        LOG.info("<<< Topology updated — ST recomputed, flood rules refreshed")
+        LOG.info("<<< Topology updated — path cache invalidated")
 
     @set_ev_cls(topo_event.EventLinkDelete)
     def _link_delete_handler(self, ev) -> None:
@@ -437,10 +567,6 @@ class Backend(app_manager.OSKenApp):
         """Register switch ports from dp.ports if not already done.
 
         Returns True if ports were initialized in this call.
-        os-ken's switches app populates dp.ports via EventOFPPortDescStatsReply,
-        which happens asynchronously after switch features. We call this
-        opportunistically (on first packet-in, first link event, etc.) to
-        ensure ports are registered before we need them.
         """
         dpid = dp.id
         if dpid in self._ports_initialized:
@@ -463,10 +589,6 @@ class Backend(app_manager.OSKenApp):
             port_count,
             sorted(p.port_no for p in dp.ports.values() if p.port_no < 0xFFFFFFF0),
         )
-
-        # Recompute ST and install flood rules now that we have ports
-        self.st_mgr.compute()
-        self._install_all_flood_rules()
         return True
 
     # ── Helpers ──────────────────────────────────────────────────────
@@ -490,26 +612,8 @@ class Backend(app_manager.OSKenApp):
         dp.send_msg(msg)
         LOG.info("Backend: installed table-miss on dpid=%s (→ CONTROLLER)", hex(dp.id))
 
-    def _install_all_flood_rules(self) -> None:
-        """Install flood rules on all connected switches (idempotent)."""
-        switch_count = 0
-        for dpid in self.graph.switches:
-            flood_ports = self.st_mgr.flood_ports(dpid)
-            if flood_ports:
-                self.flow_installer.install_flood_rules(dpid, flood_ports)
-                switch_count += 1
-        LOG.info(
-            "Backend: flood rules installed on %d/%d switches",
-            switch_count,
-            len(self.graph.switches),
-        )
-
     def _start_services(self) -> None:
-        """Launch background services from the os-ken event loop.
-
-        StatsCollector runs as an Eventlet greenthread; RestAPI runs in a
-        dedicated daemon thread to keep its asyncio loop isolated.
-        """
+        """Launch background services from the os-ken event loop."""
         LOG.info("Backend: launching background services")
         eventlet.spawn_after(0.0, self.stats_collector._poll_loop)
         self.rest_api.start(host="0.0.0.0", port=8080)

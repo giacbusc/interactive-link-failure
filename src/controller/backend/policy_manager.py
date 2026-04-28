@@ -139,9 +139,12 @@ class PolicyManager:
         pair = (src_mac, dst_mac)
         with self._lock:
             old = self._policies.get(pair)
+            # Remove old flows whether the policy was ACTIVE or BROKEN.
+            # BROKEN policies have orphan sticky flows that must be cleaned up.
             old_path = (
                 list(old.path)
-                if old is not None and old.state == PolicyState.POLICY_ACTIVE
+                if old is not None
+                and old.state in (PolicyState.POLICY_ACTIVE, PolicyState.POLICY_BROKEN)
                 else None
             )
             entry = PolicyEntry(state=PolicyState.POLICY_ACTIVE, path=list(path))
@@ -206,23 +209,28 @@ class PolicyManager:
         return True
 
     def mark_broken(self, src_mac: str, dst_mac: str) -> None:
-        """Transition a POLICY_ACTIVE pair to POLICY_BROKEN (link failure)."""
+        """Transition a POLICY_ACTIVE pair to POLICY_BROKEN and delete sticky flows."""
+        removed_path = None
         with self._lock:
             entry = self._policies.get((src_mac, dst_mac))
             if entry is not None and entry.state == PolicyState.POLICY_ACTIVE:
                 entry.state = PolicyState.POLICY_BROKEN
+                removed_path = list(entry.path)
                 LOG.warning(
                     "PolicyManager: %s → %s → POLICY_BROKEN (link failure)",
                     src_mac,
                     dst_mac,
                 )
+        if removed_path:
+            self._remove_flows(src_mac, dst_mac, removed_path)
 
     def mark_all_affected_broken(self, link: LinkKey) -> list[tuple[str, str]]:
-        """Mark all policy pairs traversing *link* as BROKEN.
+        """Mark all policy pairs traversing *link* as BROKEN and delete sticky flows.
 
         Returns the list of affected (src_mac, dst_mac) pairs.
         """
         affected: list[tuple[str, str]] = []
+        to_remove: list[tuple[str, str, list[LinkKey]]] = []
         undirected = link.undirected_key
         with self._lock:
             for pair, entry in self._policies.items():
@@ -232,6 +240,7 @@ class PolicyManager:
                     if lk.undirected_key == undirected:
                         entry.state = PolicyState.POLICY_BROKEN
                         affected.append(pair)
+                        to_remove.append((pair[0], pair[1], list(entry.path)))
                         LOG.warning(
                             "PolicyManager: %s → %s → BROKEN (link %s:%d→%s:%d)",
                             pair[0],
@@ -242,6 +251,36 @@ class PolicyManager:
                             link.dst_port,
                         )
                         break  # one failed link is enough
+        for src, dst, path in to_remove:
+            self._remove_flows(src, dst, path)
+        return affected
+
+    def mark_all_for_mac_broken(self, mac: str) -> list[tuple[str, str]]:
+        """Mark all ACTIVE policies involving *mac* as BROKEN (host moved/disconnected).
+
+        Also deletes the sticky flows since the host is no longer reachable
+        at its previous location.
+
+        Returns the list of affected (src_mac, dst_mac) pairs.
+        """
+        affected: list[tuple[str, str]] = []
+        to_remove: list[tuple[str, str, list[LinkKey]]] = []
+        with self._lock:
+            for (src, dst), entry in self._policies.items():
+                if (
+                    src == mac or dst == mac
+                ) and entry.state == PolicyState.POLICY_ACTIVE:
+                    entry.state = PolicyState.POLICY_BROKEN
+                    affected.append((src, dst))
+                    to_remove.append((src, dst, list(entry.path)))
+                    LOG.warning(
+                        "PolicyManager: %s → %s → BROKEN (host %s moved/disconnected)",
+                        src,
+                        dst,
+                        mac,
+                    )
+        for src, dst, path in to_remove:
+            self._remove_flows(src, dst, path)
         return affected
 
     def delete_all(self) -> None:

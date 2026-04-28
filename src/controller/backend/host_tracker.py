@@ -1,14 +1,19 @@
-"""HostTracker — learns MAC → (dpid, port) from packet-in events."""
+"""HostTracker — thread-safe IP-MAC-Switch-Port binding table.
+
+MAC→location is populated from os-ken topology events
+(EventHostAdd / EventHostMove).  IP→MAC mappings are populated
+from ARP packet inspection in the controller's packet-in handler.
+
+os-ken runs its own host discovery before our app sees the packet,
+so MAC locations are always up-to-date when we consume them.
+"""
 
 from __future__ import annotations
 
 import logging
 import threading
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional
-
-if TYPE_CHECKING:
-    from topology import TopologyGraph
+from dataclasses import dataclass, field
+from typing import Optional
 
 LOG = logging.getLogger(__name__)
 
@@ -19,89 +24,79 @@ class HostLocation:
     port: int
 
 
+@dataclass
+class HostEntry:
+    location: HostLocation
+    ips: set[str] = field(default_factory=set)
+
+
 class HostTracker:
-    """Maps MAC addresses to their most recently observed switch + port."""
+    """Thread-safe host binding table.
 
-    def __init__(self, graph: Optional[TopologyGraph] = None) -> None:
-        self._table: dict[str, HostLocation] = {}
+    MAC locations are fed by the Backend when os-ken fires
+    EventHostAdd / EventHostMove.  IP addresses are fed by the
+    packet-in handler when it sees ARP / IPv4 packets.
+    """
+
+    def __init__(self) -> None:
+        self._table: dict[str, HostEntry] = {}
         self._lock = threading.Lock()
-        self._graph = graph
 
-    def learn(self, mac: str, dpid: int, port: int) -> Optional[HostLocation]:
-        """Learn a host location.
+    # ── Mutators (called from os-ken event loop) ──────────────────────
 
-        Returns the *previous* location if the host moved (so the caller can
-        purge stale flows), or None if the host was brand-new or unchanged.
+    def add_host(self, mac: str, dpid: int, port: int) -> Optional[HostLocation]:
+        """Record a host location (from os-ken EventHostAdd / EventHostMove).
+
+        Returns the previous location if the host moved, or None.
         """
         with self._lock:
-            prev = self._table.get(mac)
-            if prev is not None:
-                if prev.dpid == dpid and prev.port == port:
-                    LOG.debug(
-                        "HostTracker: refreshed %s → dpid=%s port=%d",
-                        mac,
-                        hex(dpid),
-                        port,
-                    )
-                    return None
-                if not self._is_edge_port(dpid, port):
-                    LOG.warning(
-                        "HostTracker: %s seen at dpid=%s port=%d (internal) "
-                        "but already known at dpid=%s port=%d — keeping original",
-                        mac,
-                        hex(dpid),
-                        port,
-                        hex(prev.dpid),
-                        prev.port,
-                    )
-                    return None
+            loc = HostLocation(dpid, port)
+            entry = self._table.get(mac)
+            if entry is None:
+                self._table[mac] = HostEntry(location=loc)
                 LOG.info(
-                    "HostTracker: %s MOVED from dpid=%s port=%d → dpid=%s port=%d",
+                    "HostTracker: added %s → dpid=%s port=%d (total=%d)",
                     mac,
-                    hex(prev.dpid),
-                    prev.port,
                     hex(dpid),
                     port,
+                    len(self._table),
                 )
-                old_loc = prev
-            else:
-                if not self._is_edge_port(dpid, port):
-                    LOG.warning(
-                        "HostTracker: ignoring %s at dpid=%s port=%d (internal, new)",
-                        mac,
-                        hex(dpid),
-                        port,
-                    )
-                    return None
-                old_loc = None
-            self._table[mac] = HostLocation(dpid, port)
-        LOG.info(
-            "HostTracker: learned %s → dpid=%s port=%d (total=%d)",
-            mac,
-            hex(dpid),
-            port,
-            len(self._table),
-        )
-        return old_loc
-
-    def lookup(self, mac: str) -> Optional[HostLocation]:
-        """Return the most recently observed location of *mac*, or None."""
-        with self._lock:
-            loc = self._table.get(mac)
-        if loc:
-            LOG.debug(
-                "HostTracker: lookup %s → dpid=%s port=%d", mac, hex(loc.dpid), loc.port
+                return None
+            prev = entry.location
+            if prev == loc:
+                return None
+            entry.location = loc
+            LOG.info(
+                "HostTracker: %s MOVED dpid=%s:%d → dpid=%s:%d",
+                mac,
+                hex(prev.dpid),
+                prev.port,
+                hex(dpid),
+                port,
             )
-        else:
-            LOG.debug("HostTracker: lookup %s → UNKNOWN", mac)
-        return loc
+            return prev
+
+    def add_ip(self, mac: str, ip: str) -> None:
+        """Associate an IPv4 address with *mac* (from observed traffic)."""
+        with self._lock:
+            entry = self._table.get(mac)
+            if entry is None:
+                LOG.debug(
+                    "HostTracker: add_ip %s for unknown MAC %s — ignored", ip, mac
+                )
+                return
+            if ip not in entry.ips:
+                entry.ips.add(ip)
+                LOG.info(
+                    "HostTracker: %s now has IP %s (total=%d)", mac, ip, len(entry.ips)
+                )
 
     def remove_by_port(self, dpid: int, port: int) -> list[str]:
-        """Remove all hosts learned on *(dpid, port)*. Returns the removed MACs."""
+        """Remove all hosts on *(dpid, port)*. Returns the removed MACs."""
         removed: list[str] = []
         with self._lock:
-            for mac, loc in list(self._table.items()):
-                if loc.dpid == dpid and loc.port == port:
+            for mac, entry in list(self._table.items()):
+                if entry.location == HostLocation(dpid, port):
                     del self._table[mac]
                     removed.append(mac)
         if removed:
@@ -114,18 +109,44 @@ class HostTracker:
             )
         return removed
 
+    def remove_mac(self, mac: str) -> Optional[HostEntry]:
+        """Remove a single host entry."""
+        with self._lock:
+            return self._table.pop(mac, None)
+
+    # ── Queries (safe from any thread) ────────────────────────────────
+
+    def lookup(self, mac: str) -> Optional[HostLocation]:
+        """Return the location of *mac*, or None."""
+        with self._lock:
+            entry = self._table.get(mac)
+        if entry:
+            return entry.location
+        return None
+
+    def lookup_by_ip(self, ip: str) -> Optional[tuple[str, int, int]]:
+        """Return (mac, dpid, port) for the host owning *ip*, or None."""
+        with self._lock:
+            for mac, entry in self._table.items():
+                if ip in entry.ips:
+                    return (mac, entry.location.dpid, entry.location.port)
+        return None
+
+    def get_all_hosts(self) -> list[dict]:
+        """Return all known hosts with IP, MAC, and location — for the REST API."""
+        with self._lock:
+            return [
+                {
+                    "mac": mac,
+                    "ips": sorted(entry.ips),
+                    "dpid": entry.location.dpid,
+                    "port": entry.location.port,
+                }
+                for mac, entry in self._table.items()
+            ]
+
     @property
     def hosts(self) -> dict[str, HostLocation]:
-        """Return a snapshot of all known MAC→location mappings."""
+        """Return a snapshot of all MAC→location mappings."""
         with self._lock:
-            return dict(self._table)
-
-    def _is_edge_port(self, dpid: int, port: int) -> bool:
-        """True if (dpid, port) is a known edge (host-facing) port.
-
-        If no graph reference is available, conservatively returns True
-        (allows mobility without the safety check).
-        """
-        if self._graph is None:
-            return True
-        return (dpid, port) in self._graph.edge_ports
+            return {mac: entry.location for mac, entry in self._table.items()}
