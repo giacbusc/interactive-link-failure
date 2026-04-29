@@ -159,26 +159,29 @@ def test_policy_link_recovery():
     net.configLinkStatus("s2", "s3", "up")
     time.sleep(6)
 
-    # Check if the policy auto-recovered to ACTIVE
     # Per design: a pinned path should NOT auto-recover. The admin must
-    # explicitly re-pin or delete the policy. If the implementation
-    # auto-recovers, this is a bug (similar to the auto-fallback issue).
+    # explicitly re-pin or delete the policy.  After deletion the default
+    # shortest path takes over and pings should succeed.
     info("*** [6] Check if policy auto-recovered after link restoration\n")
     status, data = _api_get("/policy/00:00:00:00:00:01/00:00:00:00:00:02")
     info(f"INFO: policy state after link restoration = {data.get('state')}\n")
 
-    # Ping should work now (default routing took over after the break)
-    info("*** [7] Ping after recovery\n")
+    info("*** [7] DELETE policy (must remove BROKEN policy first)\n")
+    status, _ = _api_delete("/policy/00:00:00:00:00:01/00:00:00:00:00:02")
+    if status != 200:
+        info(f"FAIL: DELETE /policy returned {status}\n")
+        passed = False
+    else:
+        info("PASS: DELETE /policy\n")
+
+    # Ping should work now (default routing after policy removal)
+    info("*** [8] Ping after recovery\n")
     loss = net.pingAll()
     if loss != 0.0:
         info(f"FAIL: ping loss: {loss}%\n")
         passed = False
     else:
         info("PASS: 0% loss\n")
-
-    # Cleanup
-    info("*** [8] DELETE policy\n")
-    _api_delete("/policy/00:00:00:00:00:01/00:00:00:00:00:02")
 
     net.stop()
     subprocess.run(["mn", "-c"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
