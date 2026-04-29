@@ -184,53 +184,62 @@ class RestAPI:
             _validate_mac_404(src_loc, src_mac, "SRC")
             _validate_mac_404(dst_loc, dst_mac, "DST")
 
-            # Check policy plane first
+            # Check policy plane first — both directions
             entry = api._policy_mgr.get_policy(src_mac, dst_mac)
-            if entry is not None and entry.state == PolicyState.POLICY_ACTIVE:
-                dpids = []
-                if entry.path:
-                    dpids = [entry.path[0].src_dpid]
-                    for lk in entry.path:
-                        dpids.append(lk.dst_dpid)
-                return JSONResponse(
-                    content={
-                        "src_mac": src_mac,
-                        "dst_mac": dst_mac,
-                        "plane": "policy",
-                        "state": entry.state.value,
-                        "hops": _build_hops(
-                            dpids,
-                            entry.path,
-                            api._graph,
-                            api._host_tracker,
-                            src_mac,
-                            dst_mac,
-                        ),
-                    }
-                )
+            is_reverse = False
+            if entry is None:
+                entry = api._policy_mgr.get_policy(dst_mac, src_mac)
+                is_reverse = True
 
-            if entry is not None and entry.state == PolicyState.POLICY_BROKEN:
-                dpids = []
-                if entry.path:
-                    dpids = [entry.path[0].src_dpid]
-                    for lk in entry.path:
-                        dpids.append(lk.dst_dpid)
-                return JSONResponse(
-                    content={
-                        "src_mac": src_mac,
-                        "dst_mac": dst_mac,
-                        "plane": "policy",
-                        "state": entry.state.value,
-                        "hops": _build_hops(
-                            dpids,
-                            entry.path,
-                            api._graph,
-                            api._host_tracker,
-                            src_mac,
-                            dst_mac,
-                        ),
-                    }
-                )
+            if entry is not None and entry.state in (
+                PolicyState.POLICY_ACTIVE,
+                PolicyState.POLICY_BROKEN,
+            ):
+                if is_reverse:
+                    rev_links = [lk.reverse for lk in reversed(entry.path)]
+                    dpids: list[int] = []
+                    if rev_links:
+                        dpids = [rev_links[0].src_dpid]
+                        for lk in rev_links:
+                            dpids.append(lk.dst_dpid)
+                    return JSONResponse(
+                        content={
+                            "src_mac": src_mac,
+                            "dst_mac": dst_mac,
+                            "plane": "policy",
+                            "state": entry.state.value,
+                            "hops": _build_hops(
+                                dpids,
+                                rev_links,
+                                api._graph,
+                                api._host_tracker,
+                                src_mac,
+                                dst_mac,
+                            ),
+                        }
+                    )
+                else:
+                    dpids: list[int] = []
+                    if entry.path:
+                        dpids = [entry.path[0].src_dpid]
+                        for lk in entry.path:
+                            dpids.append(lk.dst_dpid)
+                    return JSONResponse(
+                        content={
+                            "src_mac": src_mac,
+                            "dst_mac": dst_mac,
+                            "plane": "policy",
+                            "state": entry.state.value,
+                            "hops": _build_hops(
+                                dpids,
+                                entry.path,
+                                api._graph,
+                                api._host_tracker,
+                                src_mac,
+                                dst_mac,
+                            ),
+                        }
+                    )
 
             # Default plane: check RouteTracker then PathComputer
             pair_links = api._route_tracker.links_for_pair(src_mac, dst_mac)

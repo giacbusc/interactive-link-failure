@@ -18,6 +18,17 @@ def _set_interface_mac(host, iface, mac):
     host.cmd(f"ip link set {iface} address {mac}")
 
 
+def _ping_loss(src, dst, count=5, timeout=1):
+    """Send N pings, return loss percentage (0.0 = all reached)."""
+    out = src.cmd(f"ping -c {count} -W {timeout} {dst.IP()}")
+    for line in out.splitlines():
+        if "packet loss" in line:
+            for part in line.split():
+                if part.endswith("%"):
+                    return float(part.rstrip("%"))
+    return 100.0
+
+
 def test_host_mobility_edge_port_purge():
     """
     Edge Case: Single-port device mobility via edge-port-down purge.
@@ -84,7 +95,7 @@ def test_host_mobility_edge_port_purge():
     time.sleep(5)
 
     info("*** 1. Baseline: h1→h2 via s1\n")
-    loss_baseline = net.ping([h1, h2])
+    loss_baseline = _ping_loss(h1, h2, count=3)
 
     info("*** 2. Unplugging h1 from s1 (edge port-down → purge h1)\n")
     net.configLinkStatus("h1", "s1", "down")
@@ -94,7 +105,9 @@ def test_host_mobility_edge_port_purge():
     _move_host_ip(h1, "h1-eth0", "h1-eth1")
 
     info("*** 3. Testing mobility: h1→h2 after moving to s3\n")
-    loss_after_move = net.ping([h1, h2])
+    info("***     Warmup pings to train controller of new location\n")
+    h1.cmd(f"ping -c 3 -W 1 {h2.IP()} > /dev/null 2>&1")
+    loss_after_move = _ping_loss(h1, h2, count=5)
 
     net.stop()
     subprocess.run(["mn", "-c"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)

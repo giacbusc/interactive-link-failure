@@ -270,6 +270,17 @@ class Backend(app_manager.OSKenApp):
         if dst_mac == LLDP_MAC:
             return
 
+        # ── Learn source host from packet (edge ports only) ─────────
+        # os-ken's host_discovery_packet_in_handler already detected the
+        # host location and enqueued an EventHostMove/EventHostAdd *before*
+        # this handler runs.  That event has NOT been dispatched yet, so
+        # our HostTracker may still be blind to this host (e.g. after an
+        # edge-port purge).  Learn it here synchronously so the rest of
+        # this handler (add_ip, forwarding) sees the current location.
+        if not (src_mac == "ff:ff:ff:ff:ff:ff" or int(src_mac[:2], 16) & 1):
+            if (dpid, in_port) in self.graph.edge_ports:
+                self.host_tracker.add_host(src_mac, dpid, in_port)
+
         # ── ARP processing ───────────────────────────────────────────
         arp = pkt.get_protocol(arp_packet.arp)
         if arp is not None:
@@ -321,7 +332,10 @@ class Backend(app_manager.OSKenApp):
         if installed:
             dst_loc = self.host_tracker.lookup(dst_mac)
             if dst_loc:
-                out_port = self.forwarding.get_output_port(dpid, dst_loc.dpid)
+                if dpid == dst_loc.dpid:
+                    out_port = dst_loc.port
+                else:
+                    out_port = self.forwarding.get_output_port(dpid, dst_loc.dpid)
                 if out_port is not None:
                     LOG.info(
                         "PacketIn: forwarding first packet %s → %s out port %d",

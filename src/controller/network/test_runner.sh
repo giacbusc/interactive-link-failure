@@ -6,7 +6,9 @@
 # then stops the controller. Controller and test output are saved to
 # separate files under results/.
 #
-# Usage: sudo ./test_runner.sh
+# Usage: sudo ./test_runner.sh [test_name]
+#   test_name: optional — run only tests matching this substring (e.g. "vlan", "test_vlan.py")
+#              if omitted, all test_*.py files are run.
 #
 
 set -uo pipefail
@@ -31,15 +33,30 @@ done
 mkdir -p "$RUN_DIR"
 
 # Gather test files (sorted)
+filters=("$@")
 tests=()
 while IFS= read -r f; do
-    tests+=("$f")
+    test_name="$(basename "$f" .py)"
+    if [ "${#filters[@]}" -eq 0 ]; then
+        tests+=("$f")
+    else
+        for filter in "${filters[@]}"; do
+            if [[ "$test_name" == *"$filter"* ]] || [[ "$(basename "$f")" == *"$filter"* ]]; then
+                tests+=("$f")
+                break
+            fi
+        done
+    fi
 done < <(find "$NETWORK_DIR" -maxdepth 1 -name 'test_*.py' -type f | sort)
 
 total=${#tests[@]}
 if [ "$total" -eq 0 ]; then
-    echo "Error: No test files found in $NETWORK_DIR" >&2
+    echo "Error: No matching test files found${filters:+ for \"${filters[*]}\"} in $NETWORK_DIR" >&2
     exit 1
+fi
+
+if [ "${#filters[@]}" -gt 0 ]; then
+    echo "Filter: running ${total} test(s) matching: ${filters[*]}"
 fi
 
 # ---- Helpers -------------------------------------------------------------

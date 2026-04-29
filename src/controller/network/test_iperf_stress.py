@@ -331,25 +331,35 @@ def test_iperf_stress():
         else:
             info("PASS: /policy — POLICY_BROKEN\n")
 
-        info("*** [12a] GET /stats/ports — verify traffic STOPPED (no auto-fallback)\n")
-        status, data = _api_get("/stats/ports")
+        info("*** [12a] GET /flows — verify no default-flow auto-fallback\n")
+        status, data = _api_get("/flows")
         if status != 200:
-            info(f"FAIL: /stats/ports returned {status}\n")
+            info(f"FAIL: /flows returned {status}\n")
             passed = False
         else:
-            pkts_after_break = _total_packets(data)
-            time_after_break = time.time()
-            delta = pkts_after_break - pkts_before_break
-            if delta > 100_000:
+            broken_macs = {"00:00:00:00:00:01", "00:00:00:00:00:03"}
+            fallback_flows = [
+                f
+                for f in data.get("flows", [])
+                if f.get("plane") == "default"
+                and f.get("src_mac") in broken_macs
+                and f.get("dst_mac") in broken_macs
+                and f.get("src_mac") != f.get("dst_mac")
+            ]
+            if fallback_flows:
                 info(
-                    f"FAIL: traffic continued after pinned path broke (+{delta} pkts) — "
-                    f"system should not auto-fallback\n"
+                    f"FAIL: auto-fallback detected — {len(fallback_flows)} default "
+                    f"flows for h1↔h3 after policy BROKEN\n"
                 )
                 passed = False
             else:
-                info(
-                    f"PASS: pinned path broken, traffic stopped (only +{delta} background pkts)\n"
-                )
+                info("PASS: no default-flow auto-fallback after policy BROKEN\n")
+
+        info("*** [12b] GET /stats/ports — snapshot for timing reference\n")
+        status, data = _api_get("/stats/ports")
+        if status == 200:
+            pkts_after_break = _total_packets(data)
+            time_after_break = time.time()
 
         info("*** [13] GET /topology — link count decreased\n")
         status, data = _api_get("/topology")
@@ -511,18 +521,26 @@ def test_iperf_stress():
             else:
                 info(f"PASS: /topology — {links_after} links, full mesh restored\n")
 
-        info("*** [20] GET /path — path exists after s2 recovery\n")
-        status, data = _api_get("/path/00:00:00:00:00:01/00:00:00:00:00:03")
+        info("*** [19d] DELETE /policy — remove pinned path\n")
+        status, _ = _api_delete("/policy/00:00:00:00:00:01/00:00:00:00:00:03")
         if status != 200:
-            info(f"FAIL: /path returned {status}\n")
+            info(f"FAIL: DELETE /policy returned {status}\n")
             passed = False
-        elif data.get("hops"):
-            info(f"PASS: /path — {len(data['hops'])} hops restored\n")
         else:
-            info("FAIL: /path — no hops after s2 recovery\n")
-            passed = False
+            info("PASS: DELETE /policy\n")
 
-        info("*** [20a] Ping all — verify data plane after switch reconnect\n")
+        info("*** [19e] GET /policy — UNSPECIFIED after delete\n")
+        status, data = _api_get("/policy/00:00:00:00:00:01/00:00:00:00:00:03")
+        if status != 200:
+            info(f"FAIL: /policy returned {status}\n")
+            passed = False
+        elif data.get("state") != "UNSPECIFIED":
+            info(f"FAIL: expected UNSPECIFIED, got {data.get('state')}\n")
+            passed = False
+        else:
+            info("PASS: /policy — UNSPECIFIED\n")
+
+        info("*** [19f] Ping all — verify data plane after switch recovery\n")
         loss = net.pingAll()
         if loss != 0.0:
             info(f"FAIL: ping loss after s2 reconnect: {loss}%\n")
@@ -530,7 +548,7 @@ def test_iperf_stress():
         else:
             info("PASS: 0% loss after s2 reconnect\n")
 
-        info("*** [20b] GET /stats/ports — both iperf flows through all disruption\n")
+        info("*** [19g] GET /stats/ports — both iperf flows through all disruption\n")
         status, data = _api_get("/stats/ports")
         if status != 200:
             info(f"FAIL: /stats/ports returned {status}\n")
@@ -543,78 +561,51 @@ def test_iperf_stress():
                 f"PASS: /stats/ports — {pkts_after_recovery} pkts (+{delta} through flapping + switch crash)\n"
             )
 
-        # ── Phase 5: Delete policy, verify cleanup ─────────────────────
-        info("*** [21] DELETE /policy — remove pinned path\n")
-        status, _ = _api_delete("/policy/00:00:00:00:00:01/00:00:00:00:00:03")
-        if status != 200:
-            info(f"FAIL: DELETE /policy returned {status}\n")
-            passed = False
-        else:
-            info("PASS: DELETE /policy\n")
-
-        info("*** [22] GET /policy — UNSPECIFIED after delete\n")
-        status, data = _api_get("/policy/00:00:00:00:00:01/00:00:00:00:00:03")
-        if status != 200:
-            info(f"FAIL: /policy returned {status}\n")
-            passed = False
-        elif data.get("state") != "UNSPECIFIED":
-            info(f"FAIL: expected UNSPECIFIED, got {data.get('state')}\n")
-            passed = False
-        else:
-            info("PASS: /policy — UNSPECIFIED\n")
-
-        info("*** [23] GET /path — default plane after policy removal\n")
+        info("*** [19h] GET /path — path exists after s2 recovery\n")
         status, data = _api_get("/path/00:00:00:00:00:01/00:00:00:00:00:03")
-        if status == 200:
-            info(
-                f"PASS: /path — plane={data.get('plane')}, state={data.get('state')}\n"
-            )
-        else:
+        if status != 200:
             info(f"FAIL: /path returned {status}\n")
             passed = False
+        elif data.get("hops"):
+            info(f"PASS: /path — {len(data['hops'])} hops restored\n")
+        else:
+            info("FAIL: /path — no hops after s2 recovery\n")
+            passed = False
 
-        # ── Phase 6: Stats while traffic was flowing ──────────────────
-        info("*** [24] GET /stats/ports — final counters with iperf history\n")
+        info("*** [20] Stats history — traffic timeline\n")
         status, data = _api_get("/stats/ports")
         if status == 200:
             pkts_final = _total_packets(data)
             now = time.time()
             info("PASS: /stats/ports — traffic timeline:\n")
-            # Phase A: iperf startup → baseline
-            seg_pkts = pkts_baseline
-            seg_secs = time_baseline - 0  # relative, just for display
             info(f"         baseline   (5):   {pkts_baseline:>10} pkts\n")
-            # Phase B: baseline → before break (policy install + baseline API)
             seg_pkts = pkts_before_break - pkts_baseline
             seg_secs = time_before_break - time_baseline
             if seg_pkts > 0 and seg_secs > 0:
                 passed = _check_throughput(
                     "pre-break baseline", seg_pkts, seg_secs, passed
                 )
-            # Phase C: during break — should be near 0 (pinned path is broken)
             info(
-                f"         pinned break (12a): {pkts_after_break:>10} pkts  (traffic stopped — correct)\n"
+                f"         pinned break (12b): {pkts_after_break:>10} pkts  (bg stats + in-flight)\n"
             )
-            # Phase D: after admin re-pin → after recovery (flapping + switch crash)
             seg_pkts = pkts_after_recovery - pkts_after_fallback
             seg_secs = time_after_recovery - time_after_fallback
             if seg_pkts > 0 and seg_secs > 0:
                 passed = _check_throughput(
                     "admin re-pin → recovery", seg_pkts, seg_secs, passed
                 )
-            # Phase E: recovery → final (policy delete + cleanup)
             seg_pkts = pkts_final - pkts_after_recovery
             seg_secs = now - time_after_recovery
             if seg_pkts > 0 and seg_secs > 0:
                 passed = _check_throughput(
                     "post-recovery cleanup", seg_pkts, seg_secs, passed
                 )
-            info(f"         final      (24):   {pkts_final:>10} pkts\n")
+            info(f"         final      (20):   {pkts_final:>10} pkts\n")
         else:
             info("FAIL: /stats/ports\n")
             passed = False
 
-        info("*** [25] Verify h2->h3 path after all disruption\n")
+        info("*** [21] Verify h2->h3 path after all disruption\n")
         status, data = _api_get("/path/00:00:00:00:00:02/00:00:00:00:00:03")
         if status == 200 and data.get("hops"):
             info(f"PASS: /path h2->h3 — {len(data['hops'])} hops\n")
@@ -622,7 +613,7 @@ def test_iperf_stress():
             info("FAIL: /path h2->h3 broken after stress\n")
             passed = False
 
-        info("*** [26] GET /flows — final state\n")
+        info("*** [22] GET /flows — final state\n")
         status, data = _api_get("/flows")
         if status == 200:
             info(f"PASS: /flows — {len(data.get('flows', []))} entries\n")

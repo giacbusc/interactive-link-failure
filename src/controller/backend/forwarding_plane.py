@@ -9,7 +9,7 @@ from host_tracker import HostTracker
 from path_computer import PathComputer
 from route_tracker import RouteTracker
 from flow_installer import FlowInstaller
-from policy_manager import PolicyManager
+from policy_manager import PolicyManager, PolicyState
 from topology import LinkKey
 
 LOG = logging.getLogger(__name__)
@@ -120,6 +120,19 @@ class ForwardingPlane:
             if reverse_links:
                 self.route_tracker.add_route(dst_mac, src_mac, reverse_links)
             return True
+
+        # If a policy exists but is BROKEN, do NOT auto-fallback — drop.
+        src_pol = self.policy_mgr.get_policy(src_mac, dst_mac)
+        rev_pol = self.policy_mgr.get_policy(dst_mac, src_mac)
+        if (src_pol is not None and src_pol.state == PolicyState.POLICY_BROKEN) or (
+            rev_pol is not None and rev_pol.state == PolicyState.POLICY_BROKEN
+        ):
+            LOG.info(
+                "Forwarding: policy %s ↔ %s is BROKEN — dropping (no auto-fallback)",
+                src_mac,
+                dst_mac,
+            )
+            return False
 
         # Compute shortest path
         path = self.path_computer.compute_path(src_dpid, dst_dpid)

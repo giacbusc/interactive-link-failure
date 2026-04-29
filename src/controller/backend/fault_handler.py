@@ -83,7 +83,12 @@ class FaultHandler:
                 for mac in removed:
                     for sw_dpid in self.graph.switches:
                         self.flow_installer.delete_flows_for_mac(sw_dpid, mac)
-                    self.forwarding.route_tracker.purge_mac(mac)
+                    purged = self.forwarding.route_tracker.purge_mac(mac)
+                    # Also delete reverse-direction flows for each purged pair
+                    for pair in purged:
+                        for sw_dpid in self.graph.switches:
+                            self.flow_installer.delete_flows_for_mac(sw_dpid, pair[0])
+                            self.flow_installer.delete_flows_for_mac(sw_dpid, pair[1])
                     # Mark all policies involving this MAC as BROKEN
                     self.policy_mgr.mark_all_for_mac_broken(mac)
 
