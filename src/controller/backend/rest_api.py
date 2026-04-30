@@ -20,6 +20,7 @@ if TYPE_CHECKING:
     from fastapi import FastAPI
     from stats_collector import StatsCollector
     from event_logger import LogStore, EventCounters
+    from switch_registry import SwitchRegistry
 
 from topology import LinkKey, TopologyGraph
 from host_tracker import HostTracker
@@ -94,6 +95,7 @@ class RestAPI:
         stats_collector: "StatsCollector",
         log_store: "LogStore",
         counters: "EventCounters",
+        switch_registry: "SwitchRegistry",
     ) -> None:
         """Store references to all controller modules.
 
@@ -109,6 +111,7 @@ class RestAPI:
         self._stats_collector = stats_collector
         self._log_store = log_store
         self._counters = counters
+        self._switch_registry = switch_registry
 
         self._app: Optional["FastAPI"] = None
         self._server: Any = None
@@ -414,7 +417,7 @@ class RestAPI:
         @app.get("/topology")
         def get_topology():
             with api._graph.lock:
-                switches = sorted(api._graph.switches)
+                switch_dpids = sorted(api._graph.switches)
                 raw_links = list(api._graph.links)
 
             links = [
@@ -428,6 +431,18 @@ class RestAPI:
             ]
 
             hosts = api._host_tracker.get_all_hosts()
+
+            switches = []
+            for dpid in switch_dpids:
+                info = api._switch_registry.get(dpid)
+                switch_entry: dict[str, Any] = {"dpid": dpid}
+                if info:
+                    switch_entry["vendor"] = info.vendor_label
+                    switch_entry["hw_desc"] = info.hw_desc
+                    switch_entry["sw_desc"] = info.sw_desc
+                    switch_entry["num_ports"] = info.num_ports
+                    switch_entry["main_table"] = info.main_table
+                switches.append(switch_entry)
 
             return JSONResponse(
                 content={

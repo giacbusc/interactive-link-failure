@@ -14,6 +14,11 @@ if TYPE_CHECKING:
 
 from topology import LinkKey, TopologyGraph
 
+if TYPE_CHECKING:
+    from switch_registry import SwitchRegistry
+
+from switch_registry import Vendor
+
 LOG = logging.getLogger(__name__)
 
 # Default idle timeout for regular (non-policy) flows in seconds.
@@ -32,14 +37,10 @@ class FlowInstaller:
         self.graph = graph
         self._datapaths: dict[int, Datapath] = {}
         self._host_tracker: Optional[object] = None  # set by ForwardingPlane
-        self._switch_types: dict[int, str] = {}  # dpid → "hpe" | "default"
+        self._registry: Optional[SwitchRegistry] = None  # set by Backend
 
-    def set_switch_type(self, dpid: int, switch_type: str) -> None:
-        self._switch_types[dpid] = switch_type
-        LOG.info("FlowInstaller: switch type for dpid=%s = %s", hex(dpid), switch_type)
-
-    def get_switch_type(self, dpid: int) -> Optional[str]:
-        return self._switch_types.get(dpid)
+    def set_registry(self, registry: SwitchRegistry) -> None:
+        self._registry = registry
 
     def _main_table(self, dpid: int) -> int:
         """Return the primary flow table for a switch.
@@ -47,7 +48,9 @@ class FlowInstaller:
         HPE ArubaOS: table 0 is read-only (Goto-only), flows go on table 100.
         OVS / Zodiac FX / others: single flat table 0.
         """
-        return 100 if self._switch_types.get(dpid) == "hpe" else 0
+        if self._registry is not None:
+            return self._registry.main_table(dpid)
+        return 0
 
     def register_dp(self, dp: Datapath) -> None:
         """Store a datapath handle for later flow-mod operations.
@@ -73,7 +76,6 @@ class FlowInstaller:
         during ``purge_switch()`` will not target this dpid.
         """
         self._datapaths.pop(dpid, None)
-        self._switch_types.pop(dpid, None)
         LOG.info(
             "FlowInstaller: unregistered datapath dpid=%s | total=%d",
             hex(dpid),
@@ -137,7 +139,6 @@ class FlowInstaller:
         switch connection.
         """
         ofp_parser = dp.ofproto_parser
-        switch_type = self.get_switch_type(dp.id) or "default"
 
         # Drop all IPv6 (EtherType 0x86DD)
         match_ipv6 = ofp_parser.OFPMatch(eth_type=0x86DD)
@@ -156,7 +157,7 @@ class FlowInstaller:
         # HPE table 100 does not support masked eth_dst — skip the
         # multicast-specific drop; multicast will be caught by the
         # controller's zero-trust packet-in handler instead.
-        if switch_type == "hpe":
+        if self._registry is not None and self._registry.get_vendor(dp.id) == Vendor.HPE:
             LOG.info(
                 "FlowInstaller: skipping IPv4 Multicast DROP on dpid=%s "
                 "(HPE table 100 does not support masked eth_dst)",

@@ -32,6 +32,7 @@ from host_tracker import HostTracker
 from path_computer import PathComputer
 from route_tracker import RouteTracker
 from flow_installer import FlowInstaller
+from switch_registry import SwitchRegistry
 from forwarding_plane import ForwardingPlane
 from fault_handler import FaultHandler
 from policy_manager import PolicyManager
@@ -63,6 +64,8 @@ class Backend(app_manager.OSKenApp):
         self.path_computer = PathComputer(self.graph)
         self.route_tracker = RouteTracker()
         self.flow_installer = FlowInstaller(self.graph)
+        self.switch_registry = SwitchRegistry()
+        self.flow_installer.set_registry(self.switch_registry)
 
         # PolicyManager — must exist before ForwardingPlane / FaultHandler
         self.policy_mgr = PolicyManager(
@@ -110,6 +113,7 @@ class Backend(app_manager.OSKenApp):
             stats_collector=self.stats_collector,
             log_store=self.log_store,
             counters=self.counters,
+            switch_registry=self.switch_registry,
         )
 
         # Track which switches have had their ports registered.
@@ -176,6 +180,7 @@ class Backend(app_manager.OSKenApp):
 
         self._cancel_desc_fallback(dpid)
         self.flow_installer.unregister_dp(dpid)
+        self.switch_registry.remove(dpid)
 
         # Purge routes that involved this switch and delete orphaned flows
         purged = self.route_tracker.purge_switch(dpid)
@@ -628,6 +633,7 @@ class Backend(app_manager.OSKenApp):
                 port_count += 1
 
         self._ports_initialized.add(dpid)
+        self.switch_registry.set_num_ports(dpid, port_count)
         LOG.info(
             "Port init: dpid=%s registered %d ports from dp.ports: %s",
             hex(dpid),
@@ -638,8 +644,6 @@ class Backend(app_manager.OSKenApp):
 
     # ── Switch classification & baseline install ──────────────────────
 
-    _HPE_MFR_MARKERS = (b"HPE", b"Hewlett", b"Aruba", b"HP ")
-
     def _send_desc_request(self, dp: Datapath) -> None:
         req = dp.ofproto_parser.OFPDescStatsRequest(dp)
         dp.send_msg(req)
@@ -649,28 +653,24 @@ class Backend(app_manager.OSKenApp):
     def _desc_reply_handler(self, ev) -> None:
         body = ev.msg.body
         dp = ev.msg.datapath
-        mfr = body.mfr_desc
         LOG.info(
             "Backend: DESC reply dpid=%s "
             "mfr=%s hw=%s sw=%s serial=%s",
             hex(dp.id),
-            mfr,
+            body.mfr_desc,
             body.hw_desc,
             body.sw_desc,
             body.serial_num,
         )
-        is_hpe = any(marker in mfr for marker in self._HPE_MFR_MARKERS)
-        switch_type = "hpe" if is_hpe else "default"
-
-        self.flow_installer.set_switch_type(dp.id, switch_type)
+        self.switch_registry.register(dp.id, body)
         self._install_baseline(dp)
         self._cancel_desc_fallback(dp.id)
 
     def _desc_fallback(self, dpid: int) -> None:
         self._desc_fallbacks.pop(dpid, None)
-        if self.flow_installer.get_switch_type(dpid) is not None:
+        if self.switch_registry.get(dpid) is not None:
             return  # already classified
-        self.flow_installer.set_switch_type(dpid, "default")
+        self.switch_registry.set_unknown(dpid)
         dp = self.flow_installer.get_dp(dpid)
         if dp:
             self._install_baseline(dp)
