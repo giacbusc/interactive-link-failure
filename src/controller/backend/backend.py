@@ -37,6 +37,7 @@ from fault_handler import FaultHandler
 from policy_manager import PolicyManager
 from stats_collector import StatsCollector
 from rest_api import RestAPI
+from event_logger import LogStore, EventCounters
 
 LOG = logging.getLogger(__name__)
 
@@ -54,9 +55,11 @@ class Backend(app_manager.OSKenApp):
         LOG.info("=" * 60)
         LOG.info("Backend initializing — wiring all modules")
 
+        self.counters = EventCounters()
+
         self.graph = TopologyGraph()
-        self.topo_mgr = TopologyManager(self.graph)
-        self.host_tracker = HostTracker()
+        self.topo_mgr = TopologyManager(self.graph, counters=self.counters)
+        self.host_tracker = HostTracker(counters=self.counters)
         self.path_computer = PathComputer(self.graph)
         self.route_tracker = RouteTracker()
         self.flow_installer = FlowInstaller(self.graph)
@@ -83,6 +86,14 @@ class Backend(app_manager.OSKenApp):
             self.policy_mgr,
         )
 
+        # LogStore — ring-buffer handler that captures all logs for the REST API
+        self.log_store = LogStore()
+        fmt = logging.Formatter(
+            "%(message)s",
+        )
+        self.log_store.setFormatter(fmt)
+        logging.getLogger().addHandler(self.log_store)
+
         # StatsCollector — periodic port counter polling
         self.stats_collector = StatsCollector(poll_interval=5.0)
         self.stats_collector.set_datapaths_cb(
@@ -97,6 +108,8 @@ class Backend(app_manager.OSKenApp):
             route_tracker=self.route_tracker,
             policy_mgr=self.policy_mgr,
             stats_collector=self.stats_collector,
+            log_store=self.log_store,
+            counters=self.counters,
         )
 
         # Track which switches have had their ports registered.
@@ -116,6 +129,7 @@ class Backend(app_manager.OSKenApp):
         dp = ev.msg.datapath
         LOG.info(">>> SWITCH CONNECTED dpid=%s | features received", hex(dp.id))
 
+        self.counters.increment_switch_connected()
         self.flow_installer.register_dp(dp)
         self.graph.add_switch(dp.id)
 
@@ -150,6 +164,8 @@ class Backend(app_manager.OSKenApp):
             return
 
         LOG.warning(">>> SWITCH DISCONNECTED dpid=%s — cleaning up", hex(dpid))
+
+        self.counters.increment_switch_disconnected()
 
         self.flow_installer.unregister_dp(dpid)
 
@@ -313,6 +329,7 @@ class Backend(app_manager.OSKenApp):
         # The only exception is handled above (ARP processing).
         # All other broadcast/multicast traffic is silently destroyed.
         if dst_mac == "ff:ff:ff:ff:ff:ff" or int(dst_mac[:2], 16) & 1:
+            self.counters.increment_packets_dropped()
             LOG.debug(
                 "PacketIn: broadcast/multicast %s → %s on dpid=%s — dropping (zero-trust)",
                 src_mac,
@@ -348,11 +365,14 @@ class Backend(app_manager.OSKenApp):
                     self.flow_installer.send_packet_out(
                         dp, msg.data, msg.buffer_id, in_port, out_port
                     )
+                    self.counters.increment_packets_forwarded()
                     return
+            self.counters.increment_packets_dropped()
             LOG.warning(
                 "PacketIn: path installed but couldn't find output port — dropping"
             )
         else:
+            self.counters.increment_packets_dropped()
             LOG.info(
                 "PacketIn: path NOT installed for %s → %s (unknown dst) — dropping",
                 src_mac,
@@ -433,6 +453,7 @@ class Backend(app_manager.OSKenApp):
             data=reply_pkt.data,
         )
         dp.send_msg(out)
+        self.counters.increment_arp_replies_sent()
         LOG.info("ARP Reply: sent %s is at %s to %s", target_ip, target_mac, src_mac)
 
     # ── Host discovery events (from os-ken) ──────────────────────────

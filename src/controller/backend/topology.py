@@ -12,6 +12,7 @@ import networkx as nx
 if TYPE_CHECKING:
     from os_ken.controller.controller import Datapath
     from os_ken.topology.switches import Link
+    from event_logger import EventCounters
 
 LOG = logging.getLogger(__name__)
 
@@ -314,8 +315,11 @@ class TopologyManager:
     graph mutations with zero business logic.
     """
 
-    def __init__(self, graph: TopologyGraph) -> None:
+    def __init__(
+        self, graph: TopologyGraph, counters: "Optional[EventCounters]" = None
+    ) -> None:
         self.graph = graph
+        self._counters = counters
 
     def switch_enter(self, dp: Datapath) -> None:
         """Register a newly connected switch and all its ports."""
@@ -338,17 +342,26 @@ class TopologyManager:
     def port_add(self, dp: Datapath, port_no: int) -> None:
         """Register a newly added port (OFPPR_ADD)."""
         if port_no < 0xFFFFFFF0:
+            if self._counters:
+                self._counters.increment_port_up()
             LOG.info("TopoMgr: port ADD dpid=%s port=%d", hex(dp.id), port_no)
             self.graph.add_port(dp.id, port_no)
 
     def port_delete(self, dp: Datapath, port_no: int) -> None:
         """Remove a deleted port and any link that used it."""
+        if self._counters:
+            self._counters.increment_port_down()
         LOG.info("TopoMgr: port DELETE dpid=%s port=%d", hex(dp.id), port_no)
         self.graph.remove_port(dp.id, port_no)
 
     def port_modify(self, dp: Datapath, port_no: int, is_down: bool) -> None:
         """Handle a port state change (link up/down)."""
         status = "DOWN" if is_down else "UP"
+        if self._counters:
+            if is_down:
+                self._counters.increment_port_down()
+            else:
+                self._counters.increment_port_up()
         LOG.info(
             "TopoMgr: port MODIFY dpid=%s port=%d → %s", hex(dp.id), port_no, status
         )
@@ -359,6 +372,8 @@ class TopologyManager:
 
     def link_add(self, link: Link) -> None:
         """Record a newly discovered switch-to-switch link (from LLDP)."""
+        if self._counters:
+            self._counters.increment_link_up()
         LOG.info(
             "TopoMgr: LINK ADD %s:%d → %s:%d",
             hex(link.src.dpid),
@@ -376,6 +391,8 @@ class TopologyManager:
 
     def link_delete(self, link: Link) -> None:
         """Remove a timed-out switch-to-switch link (from LLDP)."""
+        if self._counters:
+            self._counters.increment_link_down()
         LOG.info(
             "TopoMgr: LINK DELETE %s:%d → %s:%d",
             hex(link.src.dpid),

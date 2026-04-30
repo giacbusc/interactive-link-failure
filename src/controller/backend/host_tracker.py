@@ -13,7 +13,10 @@ from __future__ import annotations
 import logging
 import threading
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
+
+if TYPE_CHECKING:
+    from event_logger import EventCounters
 
 LOG = logging.getLogger(__name__)
 
@@ -38,9 +41,10 @@ class HostTracker:
     packet-in handler when it sees ARP / IPv4 packets.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, counters: "Optional[EventCounters]" = None) -> None:
         self._table: dict[str, HostEntry] = {}
         self._lock = threading.Lock()
+        self._counters = counters
 
     # ── Mutators (called from os-ken event loop) ──────────────────────
 
@@ -54,6 +58,8 @@ class HostTracker:
             entry = self._table.get(mac)
             if entry is None:
                 self._table[mac] = HostEntry(location=loc)
+                if self._counters:
+                    self._counters.increment_host_added()
                 LOG.info(
                     "HostTracker: added %s → dpid=%s port=%d (total=%d)",
                     mac,
@@ -66,6 +72,8 @@ class HostTracker:
             if prev == loc:
                 return None
             entry.location = loc
+            if self._counters:
+                self._counters.increment_host_moved()
             LOG.info(
                 "HostTracker: %s MOVED dpid=%s:%d → dpid=%s:%d",
                 mac,

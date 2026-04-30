@@ -114,6 +114,7 @@ sudo ./test_runner.sh edge            # all edge case tests
 | `test_rest_api_flows.py` | `GET /flows` — default flows for pairs, policy flows at priority 20, policy flows remove default flows, flow entries carry correct source/pair metadata. |
 | `test_rest_api_stats.py` | `GET /stats/ports` — 503 when no data yet, counters increase, per-port structure, `last_updated` timestamps. |
 | `test_rest_api_failure.py` | REST API behavior under failure: topology updates after link down, path state in RouteTracker, policy state transitions to BROKEN. |
+| `test_rest_api_logs_events.py` | `GET /logs` — default params, level filtering, line limit, combined filters. `GET /events` — all event keys present, non-zero after startup and traffic. |
 
 ### Edge case tests
 

@@ -5,7 +5,8 @@ built with **os-ken** (OpenFlow 1.3) and **NetworkX**.
 
 Two forwarding planes: **default** (shortest-path with link-failure recovery) and
 **policy** (user-pinned path, no auto-fallback). A **FastAPI + uvicorn** REST API
-exposes topology, path, port-stats, and policy management endpoints.
+exposes topology, path, port-stats, policy management, live event counters, and
+a ring-buffered log store.
 
 ---
 
@@ -60,6 +61,8 @@ Backend (os-ken entry point — event dispatch only)
 │   └── PolicyManager   — per-pair state machine (UNSPECIFIED/ACTIVE/BROKEN)
 ├── FaultHandler        — link-failure response (graph update, flow purge)
 ├── StatsCollector      — periodic OFPPortStatsRequest → shared dict
+├── LogStore            — ring-buffer logging.Handler captured to REST API
+├── EventCounters       — thread-safe cumulative event counters
 └── RestAPI             — FastAPI + uvicorn in dedicated thread
 ```
 
@@ -406,6 +409,92 @@ switches. The next packet-in will trigger default shortest-path routing
 ```
 
 - **404** — no active policy exists for this pair, or MACs unknown.
+
+---
+
+### `GET /logs`
+
+Returns ring-buffered log entries captured since the controller started. All
+entries include an ISO‑8601 local-time timestamp, log level, logger name, and
+the raw message text. The existing stdout logging is unaffected.
+
+**Query parameters:**
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `level`   | `DEBUG` | Minimum severity (`DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`). Entries below this threshold are excluded. |
+| `lines`   | `ALL`   | Number of most-recent entries to return, or `ALL` for every matching entry. |
+
+**200**:
+
+```json
+{
+  "level": "DEBUG",
+  "lines": "ALL",
+  "returned": 141,
+  "entries": [
+    {
+      "timestamp": "2026-04-30T09:52:45.617+02:00",
+      "level": "INFO",
+      "logger": "stats_collector",
+      "message": "StatsCollector: created (poll_interval=5.0s)"
+    }
+  ]
+}
+```
+
+---
+
+### `GET /events`
+
+Returns cumulative counters for all network events since controller startup.
+Values are monotonic and never reset.
+
+**200**:
+
+```json
+{
+  "switch_connected": 3,
+  "switch_disconnected": 0,
+  "link_up": 6,
+  "link_down": 0,
+  "host_added": 3,
+  "host_moved": 0,
+  "port_up": 0,
+  "port_down": 0,
+  "packets_forwarded": 3,
+  "packets_dropped": 0,
+  "arp_replies_sent": 6,
+  "policies_installed": 0,
+  "policies_removed": 0
+}
+```
+
+| Counter | Description |
+|---------|-------------|
+| `switch_connected` | Total switch connection events |
+| `switch_disconnected` | Total switch disconnection events |
+| `link_up` | Link discovered (LLDP) |
+| `link_down` | Link deleted (LLDP timeout or port down) |
+| `host_added` | MAC address newly discovered |
+| `host_moved` | MAC address moved to a different port |
+| `port_up` | Port added or link state became UP |
+| `port_down` | Port deleted or link state became DOWN |
+| `packets_forwarded` | Unicast packets forwarded via `packet_out` |
+| `packets_dropped` | Packets silently dropped (unknown dst, BROKEN policy, no path, broadcast/multicast) |
+| `arp_replies_sent` | Proxy ARP replies crafted and sent |
+| `policies_installed` | User-pinned paths installed via `POST /policy` |
+| `policies_removed` | User-pinned paths removed via `DELETE /policy` |
+
+Counters are incremented by the module where the event naturally occurs:
+
+| Source | Counters |
+|--------|----------|
+| `HostTracker.add_host()` | `host_added`, `host_moved` |
+| `TopologyManager.port_add/delete/modify` | `port_up`, `port_down` |
+| `TopologyManager.link_add/delete` | `link_up`, `link_down` |
+| `Backend` packet-in handler | `switch_connected`, `switch_disconnected`, `packets_forwarded`, `packets_dropped`, `arp_replies_sent` |
+| `RestAPI` POST/DELETE policy | `policies_installed`, `policies_removed` |
 
 ---
 
