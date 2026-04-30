@@ -137,6 +137,7 @@ class FlowInstaller:
         switch connection.
         """
         ofp_parser = dp.ofproto_parser
+        switch_type = self.get_switch_type(dp.id) or "default"
 
         # Drop all IPv6 (EtherType 0x86DD)
         match_ipv6 = ofp_parser.OFPMatch(eth_type=0x86DD)
@@ -152,7 +153,17 @@ class FlowInstaller:
         LOG.info("FlowInstaller: installed IPv6 DROP on dpid=%s", hex(dp.id))
 
         # Drop IPv4 Multicast (EtherType 0x0800 + Dst MAC 01:00:5E:xx:xx:xx/24)
-        # The match: eth_type=0x0800 AND eth_dst matches 01:00:5e:*:*:*
+        # HPE table 100 does not support masked eth_dst — skip the
+        # multicast-specific drop; multicast will be caught by the
+        # controller's zero-trust packet-in handler instead.
+        if switch_type == "hpe":
+            LOG.info(
+                "FlowInstaller: skipping IPv4 Multicast DROP on dpid=%s "
+                "(HPE table 100 does not support masked eth_dst)",
+                hex(dp.id),
+            )
+            return
+
         match_mcast = ofp_parser.OFPMatch(
             eth_type=0x0800,
             eth_dst=("01:00:5e:00:00:00", "ff:ff:ff:80:00:00"),

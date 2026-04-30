@@ -389,3 +389,13 @@ Sending them returns `OFPET_PORT_MOD_FAILED`.
 | **P3**   | If using meters: `prec_level` = absolute DSCP, not delta         |
 | **P3**   | If using meters: each meter ID at most once per pipeline         |
 | **P3**   | Handle `OFPET_EXPERIMENTER` errors with HPE vendor ID `0x00002481` |
+
+---
+
+## Confirmed behaviours (Aruba 2930F, firmware WC.16.07.0003)
+
+| Flow-Mod | Field | Table 100 Result |
+|:---------|:------|:-----------------|
+| table-miss (all wildcards) → CONTROLLER | — | Accepted |
+| drop IPv6 (eth_type=0x86DD, no mask) | eth_type | Accepted |
+| drop IPv4 MC (eth_dst=01:00:5e/9 with mask) | eth_dst | **Rejected** — `OFPBMC_BAD_MASK(8)` |
