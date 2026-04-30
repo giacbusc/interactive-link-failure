@@ -32,6 +32,22 @@ class FlowInstaller:
         self.graph = graph
         self._datapaths: dict[int, Datapath] = {}
         self._host_tracker: Optional[object] = None  # set by ForwardingPlane
+        self._switch_types: dict[int, str] = {}  # dpid → "hpe" | "default"
+
+    def set_switch_type(self, dpid: int, switch_type: str) -> None:
+        self._switch_types[dpid] = switch_type
+        LOG.info("FlowInstaller: switch type for dpid=%s = %s", hex(dpid), switch_type)
+
+    def get_switch_type(self, dpid: int) -> Optional[str]:
+        return self._switch_types.get(dpid)
+
+    def _main_table(self, dpid: int) -> int:
+        """Return the primary flow table for a switch.
+
+        HPE ArubaOS: table 0 is read-only (Goto-only), flows go on table 100.
+        OVS / Zodiac FX / others: single flat table 0.
+        """
+        return 100 if self._switch_types.get(dpid) == "hpe" else 0
 
     def register_dp(self, dp: Datapath) -> None:
         """Store a datapath handle for later flow-mod operations.
@@ -57,6 +73,7 @@ class FlowInstaller:
         during ``purge_switch()`` will not target this dpid.
         """
         self._datapaths.pop(dpid, None)
+        self._switch_types.pop(dpid, None)
         LOG.info(
             "FlowInstaller: unregistered datapath dpid=%s | total=%d",
             hex(dpid),
@@ -83,6 +100,35 @@ class FlowInstaller:
         return self._datapaths.get(dpid)
 
     # ── Baseline drop rules ──────────────────────────────────────────────
+
+    def install_table_miss(self, dp: Datapath) -> None:
+        """Install a table-miss entry on the switch's primary flow table.
+
+        Unmatched packets are sent to the controller (no buffer).
+        Table defaults to the switch's primary table (100 for HPE, 0 for others).
+        """
+        ofp = dp.ofproto
+        ofp_parser = dp.ofproto_parser
+        table_id = self._main_table(dp.id)
+        match = ofp_parser.OFPMatch()
+        actions = [
+            ofp_parser.OFPActionOutput(ofp.OFPP_CONTROLLER, ofp.OFPCML_NO_BUFFER)
+        ]
+        inst = [ofp_parser.OFPInstructionActions(ofp.OFPIT_APPLY_ACTIONS, actions)]
+        msg = ofp_parser.OFPFlowMod(
+            datapath=dp,
+            priority=0,
+            match=match,
+            instructions=inst,
+            buffer_id=ofp.OFP_NO_BUFFER,
+            table_id=table_id,
+        )
+        dp.send_msg(msg)
+        LOG.info(
+            "FlowInstaller: table-miss on dpid=%s table=%d (→ CONTROLLER)",
+            hex(dp.id),
+            table_id,
+        )
 
     def install_drop_rules(self, dp: Datapath) -> None:
         """Install high-priority drop rules for IPv6 and IPv4 Multicast.
@@ -350,14 +396,20 @@ class FlowInstaller:
         idle_timeout: int,
         hard_timeout: int,
         cookie: int = 0,
+        table_id: Optional[int] = None,
     ) -> None:
         """Build and send a single OFPFlowMod message to *dp*.
 
         If *instructions* is None and *actions* is provided, builds
         OFPInstructionActions.  If both are None, the flow drops.
+
+        *table_id* defaults to the switch's primary flow table
+        (table 100 for HPE, table 0 for others).
         """
         ofp = dp.ofproto
         ofp_parser = dp.ofproto_parser
+        if table_id is None:
+            table_id = self._main_table(dp.id)
         if instructions is None:
             if actions:
                 instructions = [
@@ -374,6 +426,7 @@ class FlowInstaller:
             idle_timeout=idle_timeout,
             hard_timeout=hard_timeout,
             buffer_id=ofp.OFP_NO_BUFFER,
+            table_id=table_id,
         )
         dp.send_msg(msg)
 
