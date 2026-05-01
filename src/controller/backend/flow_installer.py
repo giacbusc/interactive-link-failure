@@ -14,6 +14,11 @@ if TYPE_CHECKING:
 
 from topology import LinkKey, TopologyGraph
 
+if TYPE_CHECKING:
+    from switch_registry import SwitchRegistry
+
+from switch_registry import Vendor
+
 LOG = logging.getLogger(__name__)
 
 # Default idle timeout for regular (non-policy) flows in seconds.
@@ -32,9 +37,28 @@ class FlowInstaller:
         self.graph = graph
         self._datapaths: dict[int, Datapath] = {}
         self._host_tracker: Optional[object] = None  # set by ForwardingPlane
+        self._registry: Optional[SwitchRegistry] = None  # set by Backend
+
+    def set_registry(self, registry: SwitchRegistry) -> None:
+        self._registry = registry
+
+    def _main_table(self, dpid: int) -> int:
+        """Return the primary flow table for a switch.
+
+        HPE ArubaOS: table 0 is read-only (Goto-only), flows go on table 100.
+        OVS / Zodiac FX / others: single flat table 0.
+        """
+        if self._registry is not None:
+            return self._registry.main_table(dpid)
+        return 0
 
     def register_dp(self, dp: Datapath) -> None:
-        """Store a datapath handle for later flow-mod operations."""
+        """Store a datapath handle for later flow-mod operations.
+
+        Called from ``Backend._switch_features_handler()`` when a switch
+        completes the OpenFlow handshake.  The datapath is needed to
+        send ``OFPFlowMod`` and ``OFPPacketOut`` messages to the switch.
+        """
         self._datapaths[dp.id] = dp
         LOG.info(
             "FlowInstaller: registered datapath dpid=%s | total=%d",
@@ -43,7 +67,14 @@ class FlowInstaller:
         )
 
     def unregister_dp(self, dpid: int) -> None:
-        """Forget a datapath (e.g., switch disconnected)."""
+        """Forget a datapath (e.g., switch disconnected).
+
+        Once unregistered, no further ``OFPFlowMod`` or ``OFPPacketOut``
+        messages will be sent to that switch.  Existing flows on the
+        switch are *not* removed — the switch will eventually time them
+        out or the surviving switches' ``delete_flows_for_mac()`` calls
+        during ``purge_switch()`` will not target this dpid.
+        """
         self._datapaths.pop(dpid, None)
         LOG.info(
             "FlowInstaller: unregistered datapath dpid=%s | total=%d",
@@ -53,14 +84,53 @@ class FlowInstaller:
 
     @property
     def datapaths(self) -> dict[int, Datapath]:
-        """Return the full dict of connected datapaths (for external polling)."""
+        """Return a snapshot of all connected datapaths (for external polling).
+
+        Used by ``StatsCollector`` to iterate all switches when sending
+        ``OFPPortStatsRequest``.  The internal dict is shallow-copied so
+        callers can safely iterate without holding a lock.
+        """
         return dict(self._datapaths)
 
     def get_dp(self, dpid: int) -> Optional[Datapath]:
-        """Return the Datapath handle for *dpid*, or None if not connected."""
+        """Return the Datapath handle for *dpid*, or None if not connected.
+
+        Used by ``Backend`` during stale-disconnect detection: compares
+        the current registered datapath with the one firing the DEAD
+        event to decide whether to ignore the disconnect.
+        """
         return self._datapaths.get(dpid)
 
     # ── Baseline drop rules ──────────────────────────────────────────────
+
+    def install_table_miss(self, dp: Datapath) -> None:
+        """Install a table-miss entry on the switch's primary flow table.
+
+        Unmatched packets are sent to the controller (no buffer).
+        Table defaults to the switch's primary table (100 for HPE, 0 for others).
+        """
+        ofp = dp.ofproto
+        ofp_parser = dp.ofproto_parser
+        table_id = self._main_table(dp.id)
+        match = ofp_parser.OFPMatch()
+        actions = [
+            ofp_parser.OFPActionOutput(ofp.OFPP_CONTROLLER, ofp.OFPCML_NO_BUFFER)
+        ]
+        inst = [ofp_parser.OFPInstructionActions(ofp.OFPIT_APPLY_ACTIONS, actions)]
+        msg = ofp_parser.OFPFlowMod(
+            datapath=dp,
+            priority=0,
+            match=match,
+            instructions=inst,
+            buffer_id=ofp.OFP_NO_BUFFER,
+            table_id=table_id,
+        )
+        dp.send_msg(msg)
+        LOG.info(
+            "FlowInstaller: table-miss on dpid=%s table=%d (→ CONTROLLER)",
+            hex(dp.id),
+            table_id,
+        )
 
     def install_drop_rules(self, dp: Datapath) -> None:
         """Install high-priority drop rules for IPv6 and IPv4 Multicast.
@@ -84,7 +154,17 @@ class FlowInstaller:
         LOG.info("FlowInstaller: installed IPv6 DROP on dpid=%s", hex(dp.id))
 
         # Drop IPv4 Multicast (EtherType 0x0800 + Dst MAC 01:00:5E:xx:xx:xx/24)
-        # The match: eth_type=0x0800 AND eth_dst matches 01:00:5e:*:*:*
+        # HPE table 100 does not support masked eth_dst — skip the
+        # multicast-specific drop; multicast will be caught by the
+        # controller's zero-trust packet-in handler instead.
+        if self._registry is not None and self._registry.get_vendor(dp.id) == Vendor.HPE:
+            LOG.info(
+                "FlowInstaller: skipping IPv4 Multicast DROP on dpid=%s "
+                "(HPE table 100 does not support masked eth_dst)",
+                hex(dp.id),
+            )
+            return
+
         match_mcast = ofp_parser.OFPMatch(
             eth_type=0x0800,
             eth_dst=("01:00:5e:00:00:00", "ff:ff:ff:80:00:00"),
@@ -328,14 +408,20 @@ class FlowInstaller:
         idle_timeout: int,
         hard_timeout: int,
         cookie: int = 0,
+        table_id: Optional[int] = None,
     ) -> None:
         """Build and send a single OFPFlowMod message to *dp*.
 
         If *instructions* is None and *actions* is provided, builds
         OFPInstructionActions.  If both are None, the flow drops.
+
+        *table_id* defaults to the switch's primary flow table
+        (table 100 for HPE, table 0 for others).
         """
         ofp = dp.ofproto
         ofp_parser = dp.ofproto_parser
+        if table_id is None:
+            table_id = self._main_table(dp.id)
         if instructions is None:
             if actions:
                 instructions = [
@@ -352,6 +438,7 @@ class FlowInstaller:
             idle_timeout=idle_timeout,
             hard_timeout=hard_timeout,
             buffer_id=ofp.OFP_NO_BUFFER,
+            table_id=table_id,
         )
         dp.send_msg(msg)
 

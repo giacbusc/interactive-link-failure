@@ -32,11 +32,13 @@ from host_tracker import HostTracker
 from path_computer import PathComputer
 from route_tracker import RouteTracker
 from flow_installer import FlowInstaller
+from switch_registry import SwitchRegistry
 from forwarding_plane import ForwardingPlane
 from fault_handler import FaultHandler
 from policy_manager import PolicyManager
 from stats_collector import StatsCollector
 from rest_api import RestAPI
+from event_logger import LogStore, EventCounters
 
 LOG = logging.getLogger(__name__)
 
@@ -54,12 +56,16 @@ class Backend(app_manager.OSKenApp):
         LOG.info("=" * 60)
         LOG.info("Backend initializing — wiring all modules")
 
+        self.counters = EventCounters()
+
         self.graph = TopologyGraph()
-        self.topo_mgr = TopologyManager(self.graph)
-        self.host_tracker = HostTracker()
+        self.topo_mgr = TopologyManager(self.graph, counters=self.counters)
+        self.host_tracker = HostTracker(counters=self.counters)
         self.path_computer = PathComputer(self.graph)
         self.route_tracker = RouteTracker()
         self.flow_installer = FlowInstaller(self.graph)
+        self.switch_registry = SwitchRegistry()
+        self.flow_installer.set_registry(self.switch_registry)
 
         # PolicyManager — must exist before ForwardingPlane / FaultHandler
         self.policy_mgr = PolicyManager(
@@ -83,6 +89,14 @@ class Backend(app_manager.OSKenApp):
             self.policy_mgr,
         )
 
+        # LogStore — ring-buffer handler that captures all logs for the REST API
+        self.log_store = LogStore()
+        fmt = logging.Formatter(
+            "%(message)s",
+        )
+        self.log_store.setFormatter(fmt)
+        logging.getLogger().addHandler(self.log_store)
+
         # StatsCollector — periodic port counter polling
         self.stats_collector = StatsCollector(poll_interval=5.0)
         self.stats_collector.set_datapaths_cb(
@@ -97,10 +111,16 @@ class Backend(app_manager.OSKenApp):
             route_tracker=self.route_tracker,
             policy_mgr=self.policy_mgr,
             stats_collector=self.stats_collector,
+            log_store=self.log_store,
+            counters=self.counters,
+            switch_registry=self.switch_registry,
         )
 
         # Track which switches have had their ports registered.
         self._ports_initialized: set[int] = set()
+
+        # DESC classification fallback timers (dpid → greenthread)
+        self._desc_fallbacks: dict[int, eventlet.GreenThread] = {}
 
         # Launch background services once the os-ken event loop starts
         eventlet.spawn_after(0.0, self._start_services)
@@ -116,6 +136,7 @@ class Backend(app_manager.OSKenApp):
         dp = ev.msg.datapath
         LOG.info(">>> SWITCH CONNECTED dpid=%s | features received", hex(dp.id))
 
+        self.counters.increment_switch_connected()
         self.flow_installer.register_dp(dp)
         self.graph.add_switch(dp.id)
 
@@ -123,9 +144,13 @@ class Backend(app_manager.OSKenApp):
         # If empty, they will be lazily initialized on first packet-in.
         self._try_init_ports(dp)
 
-        self._install_table_miss(dp)
-        self.flow_installer.install_drop_rules(dp)
-        # Invalidate path cache — topology may have changed while disconnected
+        self._send_desc_request(dp)
+
+        # Fallback: if no DESC reply within 2 s, install baseline as default
+        self._desc_fallbacks[dp.id] = eventlet.spawn_after(
+            2.0, self._desc_fallback, dp.id
+        )
+
         self.path_computer.invalidate()
         LOG.info("<<< SWITCH REGISTERED dpid=%s", hex(dp.id))
 
@@ -151,7 +176,11 @@ class Backend(app_manager.OSKenApp):
 
         LOG.warning(">>> SWITCH DISCONNECTED dpid=%s — cleaning up", hex(dpid))
 
+        self.counters.increment_switch_disconnected()
+
+        self._cancel_desc_fallback(dpid)
         self.flow_installer.unregister_dp(dpid)
+        self.switch_registry.remove(dpid)
 
         # Purge routes that involved this switch and delete orphaned flows
         purged = self.route_tracker.purge_switch(dpid)
@@ -313,6 +342,7 @@ class Backend(app_manager.OSKenApp):
         # The only exception is handled above (ARP processing).
         # All other broadcast/multicast traffic is silently destroyed.
         if dst_mac == "ff:ff:ff:ff:ff:ff" or int(dst_mac[:2], 16) & 1:
+            self.counters.increment_packets_dropped()
             LOG.debug(
                 "PacketIn: broadcast/multicast %s → %s on dpid=%s — dropping (zero-trust)",
                 src_mac,
@@ -348,11 +378,14 @@ class Backend(app_manager.OSKenApp):
                     self.flow_installer.send_packet_out(
                         dp, msg.data, msg.buffer_id, in_port, out_port
                     )
+                    self.counters.increment_packets_forwarded()
                     return
+            self.counters.increment_packets_dropped()
             LOG.warning(
                 "PacketIn: path installed but couldn't find output port — dropping"
             )
         else:
+            self.counters.increment_packets_dropped()
             LOG.info(
                 "PacketIn: path NOT installed for %s → %s (unknown dst) — dropping",
                 src_mac,
@@ -433,6 +466,7 @@ class Backend(app_manager.OSKenApp):
             data=reply_pkt.data,
         )
         dp.send_msg(out)
+        self.counters.increment_arp_replies_sent()
         LOG.info("ARP Reply: sent %s is at %s to %s", target_ip, target_mac, src_mac)
 
     # ── Host discovery events (from os-ken) ──────────────────────────
@@ -599,6 +633,7 @@ class Backend(app_manager.OSKenApp):
                 port_count += 1
 
         self._ports_initialized.add(dpid)
+        self.switch_registry.set_num_ports(dpid, port_count)
         LOG.info(
             "Port init: dpid=%s registered %d ports from dp.ports: %s",
             hex(dpid),
@@ -607,26 +642,50 @@ class Backend(app_manager.OSKenApp):
         )
         return True
 
-    # ── Helpers ──────────────────────────────────────────────────────
+    # ── Switch classification & baseline install ──────────────────────
 
-    def _install_table_miss(self, dp: Datapath) -> None:
-        """Install a table-miss entry that sends unmatched packets to the controller."""
-        ofp = dp.ofproto
-        ofp_parser = dp.ofproto_parser
-        match = ofp_parser.OFPMatch()
-        actions = [
-            ofp_parser.OFPActionOutput(ofp.OFPP_CONTROLLER, ofp.OFPCML_NO_BUFFER)
-        ]
-        inst = [ofp_parser.OFPInstructionActions(ofp.OFPIT_APPLY_ACTIONS, actions)]
-        msg = ofp_parser.OFPFlowMod(
-            datapath=dp,
-            priority=0,
-            match=match,
-            instructions=inst,
-            buffer_id=ofp.OFP_NO_BUFFER,
+    def _send_desc_request(self, dp: Datapath) -> None:
+        req = dp.ofproto_parser.OFPDescStatsRequest(dp)
+        dp.send_msg(req)
+        LOG.debug("Backend: sent OFPMP_DESC to dpid=%s", hex(dp.id))
+
+    @set_ev_cls(ofp_event.EventOFPDescStatsReply, MAIN_DISPATCHER)
+    def _desc_reply_handler(self, ev) -> None:
+        body = ev.msg.body
+        dp = ev.msg.datapath
+        LOG.info(
+            "Backend: DESC reply dpid=%s "
+            "mfr=%s hw=%s sw=%s serial=%s",
+            hex(dp.id),
+            body.mfr_desc,
+            body.hw_desc,
+            body.sw_desc,
+            body.serial_num,
         )
-        dp.send_msg(msg)
-        LOG.info("Backend: installed table-miss on dpid=%s (→ CONTROLLER)", hex(dp.id))
+        self.switch_registry.register(dp.id, body)
+        self._try_init_ports(dp)  # re-try: dp.ports is populated by now
+        self._install_baseline(dp)
+        self._cancel_desc_fallback(dp.id)
+
+    def _desc_fallback(self, dpid: int) -> None:
+        self._desc_fallbacks.pop(dpid, None)
+        if self.switch_registry.get(dpid) is not None:
+            return  # already classified
+        self.switch_registry.set_unknown(dpid)
+        dp = self.flow_installer.get_dp(dpid)
+        if dp:
+            self._try_init_ports(dp)
+            self._install_baseline(dp)
+        LOG.info("Backend: DESC fallback for dpid=%s — using default", hex(dpid))
+
+    def _cancel_desc_fallback(self, dpid: int) -> None:
+        gt = self._desc_fallbacks.pop(dpid, None)
+        if gt is not None:
+            gt.cancel()
+
+    def _install_baseline(self, dp: Datapath) -> None:
+        self.flow_installer.install_table_miss(dp)
+        self.flow_installer.install_drop_rules(dp)
 
     def _start_services(self) -> None:
         """Launch background services from the os-ken event loop."""

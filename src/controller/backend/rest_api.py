@@ -19,6 +19,8 @@ from typing import TYPE_CHECKING, Any, Optional
 if TYPE_CHECKING:
     from fastapi import FastAPI
     from stats_collector import StatsCollector
+    from event_logger import LogStore, EventCounters
+    from switch_registry import SwitchRegistry
 
 from topology import LinkKey, TopologyGraph
 from host_tracker import HostTracker
@@ -91,6 +93,9 @@ class RestAPI:
         route_tracker: RouteTracker,
         policy_mgr: PolicyManager,
         stats_collector: "StatsCollector",
+        log_store: "LogStore",
+        counters: "EventCounters",
+        switch_registry: "SwitchRegistry",
     ) -> None:
         """Store references to all controller modules.
 
@@ -104,6 +109,9 @@ class RestAPI:
         self._route_tracker = route_tracker
         self._policy_mgr = policy_mgr
         self._stats_collector = stats_collector
+        self._log_store = log_store
+        self._counters = counters
+        self._switch_registry = switch_registry
 
         self._app: Optional["FastAPI"] = None
         self._server: Any = None
@@ -409,7 +417,7 @@ class RestAPI:
         @app.get("/topology")
         def get_topology():
             with api._graph.lock:
-                switches = sorted(api._graph.switches)
+                switch_dpids = sorted(api._graph.switches)
                 raw_links = list(api._graph.links)
 
             links = [
@@ -423,6 +431,18 @@ class RestAPI:
             ]
 
             hosts = api._host_tracker.get_all_hosts()
+
+            switches = []
+            for dpid in switch_dpids:
+                info = api._switch_registry.get(dpid)
+                switch_entry: dict[str, Any] = {"dpid": dpid}
+                if info:
+                    switch_entry["vendor"] = info.vendor_label
+                    switch_entry["hw_desc"] = info.hw_desc
+                    switch_entry["sw_desc"] = info.sw_desc
+                    switch_entry["num_ports"] = info.num_ports
+                    switch_entry["main_table"] = info.main_table
+                switches.append(switch_entry)
 
             return JSONResponse(
                 content={
@@ -497,6 +517,7 @@ class RestAPI:
                 raise HTTPException(status_code=400, detail=error)
 
             api._policy_mgr.set_policy(src_mac, dst_mac, path_links)
+            api._counters.increment_policy_installed()
             return JSONResponse(
                 content={
                     "message": f"Policy installed for {src_mac} → {dst_mac}",
@@ -523,9 +544,30 @@ class RestAPI:
                     status_code=404,
                     detail=f"No active policy for pair {src_mac} → {dst_mac}",
                 )
+            api._counters.increment_policy_removed()
             return JSONResponse(
                 content={"message": f"Policy removed for {src_mac} → {dst_mac}"}
             )
+
+        # ── 7. GET /logs?level=DEBUG&lines=ALL ──────────────────────────
+
+        @app.get("/logs")
+        def get_logs(level: str = "DEBUG", lines: str = "ALL"):
+            entries = api._log_store.get_logs(level=level, lines=lines)
+            return JSONResponse(
+                content={
+                    "level": level,
+                    "lines": lines,
+                    "returned": len(entries),
+                    "entries": entries,
+                }
+            )
+
+        # ── 8. GET /events ──────────────────────────────────────────────
+
+        @app.get("/events")
+        def get_events():
+            return JSONResponse(content=api._counters.snapshot())
 
     # ── Path validation ──────────────────────────────────────────────
 

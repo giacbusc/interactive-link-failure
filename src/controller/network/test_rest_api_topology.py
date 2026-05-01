@@ -28,6 +28,16 @@ def _api_get(path: str) -> tuple[int, dict | None]:
 
 
 def test_rest_api_topology():
+    """Validate GET /topology and GET /path endpoints.
+
+    Ring topology: h1—s1—s2—s3—h2 with backup s1—s3.
+
+    Checks:
+    - /topology returns switches, links, hosts with correct structure.
+    - /path returns hop chain for known hosts, 404 for unknown.
+    - No phantom switches, hosts, or cross-switch link references.
+    - Hop entries have valid dpids and non-negative port numbers.
+    """
     subprocess.run(["mn", "-c"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     net = Mininet(controller=RemoteController, switch=OVSSwitch, build=False)
@@ -69,8 +79,10 @@ def test_rest_api_topology():
     elif not all(k in data for k in ("switches", "links", "hosts")):
         info(f"FAIL: /topology missing keys, got {list(data.keys())}\n")
         passed = False
-    elif sorted(data["switches"]) != [1, 2, 3]:
-        info(f"FAIL: /topology switches = {data['switches']}, expected [1,2,3]\n")
+    elif sorted(s["dpid"] for s in data["switches"]) != [1, 2, 3]:
+        info(
+            f"FAIL: /topology switch dpids = {[s['dpid'] for s in data['switches']]}, expected [1,2,3]\n"
+        )
         passed = False
     elif len(data["links"]) < 2:
         info(f"FAIL: /topology links = {len(data['links'])}, expected >= 2\n")
@@ -142,18 +154,18 @@ def test_rest_api_topology():
 
     info("*** 7. /topology — no phantom switches\n")
     if status == 200:
-        switches = set(data.get("switches", []))
-        if switches != {1, 2, 3}:
-            info(f"FAIL: unexpected switches reported: {switches}\n")
+        switch_dpids = {s["dpid"] for s in data.get("switches", [])}
+        if switch_dpids != {1, 2, 3}:
+            info(f"FAIL: unexpected switch dpids reported: {switch_dpids}\n")
             passed = False
         else:
             info("PASS: /topology — no phantom switches\n")
 
     info("*** 8. /topology — links only reference known switches\n")
     if status == 200:
-        known = {1, 2, 3}
-        all_src_ok = all(lk["src_dpid"] in known for lk in data.get("links", []))
-        all_dst_ok = all(lk["dst_dpid"] in known for lk in data.get("links", []))
+        known_dpids = {1, 2, 3}
+        all_src_ok = all(lk["src_dpid"] in known_dpids for lk in data.get("links", []))
+        all_dst_ok = all(lk["dst_dpid"] in known_dpids for lk in data.get("links", []))
         if not all_src_ok or not all_dst_ok:
             info("FAIL: link references unknown switch\n")
             passed = False
