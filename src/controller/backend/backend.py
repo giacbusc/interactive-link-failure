@@ -654,8 +654,7 @@ class Backend(app_manager.OSKenApp):
         body = ev.msg.body
         dp = ev.msg.datapath
         LOG.info(
-            "Backend: DESC reply dpid=%s "
-            "mfr=%s hw=%s sw=%s serial=%s",
+            "Backend: DESC reply dpid=%s mfr=%s hw=%s sw=%s serial=%s",
             hex(dp.id),
             body.mfr_desc,
             body.hw_desc,

@@ -157,7 +157,10 @@ class FlowInstaller:
         # HPE table 100 does not support masked eth_dst — skip the
         # multicast-specific drop; multicast will be caught by the
         # controller's zero-trust packet-in handler instead.
-        if self._registry is not None and self._registry.get_vendor(dp.id) == Vendor.HPE:
+        if (
+            self._registry is not None
+            and self._registry.get_vendor(dp.id) == Vendor.HPE
+        ):
             LOG.info(
                 "FlowInstaller: skipping IPv4 Multicast DROP on dpid=%s "
                 "(HPE table 100 does not support masked eth_dst)",
@@ -187,8 +190,9 @@ class FlowInstaller:
     ) -> list[LinkKey]:
         """Install flow entries along *path* (list of dpids) for dst_mac.
 
-        Installs sink-to-source (last switch first). Returns the list of
-        LinkKey objects traversed, for RouteTracker.
+        Installs sink-to-source (last switch first) to minimise the
+        inconsistency window.  Returns the LinkKey objects traversed in
+        **source→sink** order, suitable for RouteTracker.
         """
         timeout = 0 if is_policy else DEFAULT_IDLE_TIMEOUT
         priority = PRIORITY_POLICY if is_policy else PRIORITY_DEFAULT
@@ -303,6 +307,8 @@ class FlowInstaller:
                     dst_port=dst_port,
                 )
             )
+
+        links.reverse()
 
         LOG.info(
             "FlowInstaller: install_path done | %d links tracked for %s → %s",

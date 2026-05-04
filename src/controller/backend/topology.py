@@ -260,7 +260,8 @@ class TopologyGraph:
         """Return the port on *src_dpid* that connects to *dst_dpid*, or None.
 
         With MultiGraph there may be several parallel links; returns the port
-        from the first edge found (insertion order).
+        from the first edge found (insertion order).  Use
+        ``has_edge_with_ports()`` instead when parallel links are present.
         """
         with self._lock:
             if not self._graph.has_edge(src_dpid, dst_dpid):
@@ -270,6 +271,24 @@ class TopologyGraph:
                     return data["port_a"]
                 return data["port_b"]
             return None
+
+    def has_edge_with_ports(
+        self, src_dpid: int, src_port: int, dst_dpid: int, dst_port: int
+    ) -> bool:
+        """Return True if an edge with these exact port numbers exists."""
+        with self._lock:
+            if not self._graph.has_edge(src_dpid, dst_dpid):
+                return False
+            for key, data in self._graph[src_dpid][dst_dpid].items():
+                port_a = (
+                    data["port_a"] if data["dpid_a"] == src_dpid else data["port_b"]
+                )
+                port_b = (
+                    data["port_b"] if data["dpid_a"] == src_dpid else data["port_a"]
+                )
+                if port_a == src_port and port_b == dst_port:
+                    return True
+            return False
 
     def is_known_internal(self, dpid: int, port_no: int) -> bool:
         """Return True if *(dpid, port_no)* was ever part of a link (even if torn)."""
