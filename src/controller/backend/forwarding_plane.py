@@ -93,6 +93,8 @@ class ForwardingPlane:
             )
             self.flow_installer.install_path([src_dpid], src_mac, dst_mac)
             self.flow_installer.install_path([src_dpid], dst_mac, src_mac)
+            self.route_tracker.add_route(src_mac, dst_mac, [])
+            self.route_tracker.add_route(dst_mac, src_mac, [])
             return True
 
         # Check for a user-pinned policy path first

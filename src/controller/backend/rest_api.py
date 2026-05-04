@@ -44,13 +44,12 @@ def _validate_mac_404(entity: Any, mac: str, label: str) -> None:
 
 def _build_hops(
     dpids: list[int],
-    links: list[LinkKey],
     graph: TopologyGraph,
     host_tracker: HostTracker,
     src_mac: str,
     dst_mac: str,
 ) -> list[dict[str, int]]:
-    """Convert a dpid-path + link list into the hops format for GET /path."""
+    """Build hop chain (dpid, in_port, out_port) from a dpid path for GET /path."""
     if len(dpids) == 1:
         src_loc = host_tracker.lookup(src_mac)
         dst_loc = host_tracker.lookup(dst_mac)
@@ -218,7 +217,6 @@ class RestAPI:
                             "state": entry.state.value,
                             "hops": _build_hops(
                                 dpids,
-                                rev_links,
                                 api._graph,
                                 api._host_tracker,
                                 src_mac,
@@ -240,7 +238,6 @@ class RestAPI:
                             "state": entry.state.value,
                             "hops": _build_hops(
                                 dpids,
-                                entry.path,
                                 api._graph,
                                 api._host_tracker,
                                 src_mac,
@@ -281,7 +278,6 @@ class RestAPI:
                     "state": state,
                     "hops": _build_hops(
                         dpids,
-                        pair_links,
                         api._graph,
                         api._host_tracker,
                         src_mac,
@@ -337,6 +333,7 @@ class RestAPI:
                 if (src, dst) in policy_snapshot:
                     continue
                 dst_loc = api._host_tracker.lookup(dst)
+                pair_start = len(entries)
                 for lk in links:
                     out_port = lk.src_port
                     if dst_loc and lk.src_dpid == dst_loc.dpid:
@@ -353,10 +350,11 @@ class RestAPI:
                             "dst_mac": dst,
                         }
                     )
-                # Sink switch flow (last link's dst_dpid → host edge port)
-                if links and dst_loc:
-                    sink_dpid = links[-1].dst_dpid
-                    if not any(e["dpid"] == sink_dpid for e in entries[-len(links) :]):
+                # Sink switch flow (last link's dst_dpid → host edge port,
+                # or the host's own switch when the pair is same-switch)
+                if dst_loc:
+                    sink_dpid = links[-1].dst_dpid if links else dst_loc.dpid
+                    if not any(e["dpid"] == sink_dpid for e in entries[pair_start:]):
                         entries.append(
                             {
                                 "dpid": sink_dpid,
@@ -375,6 +373,7 @@ class RestAPI:
                 if pol.state != PolicyState.POLICY_ACTIVE:
                     continue
                 dst_loc = api._host_tracker.lookup(dst)
+                pol_start = len(entries)
                 for lk in pol.path:
                     out_port = lk.src_port
                     if dst_loc and lk.src_dpid == dst_loc.dpid:
@@ -395,7 +394,7 @@ class RestAPI:
                     sink_dpid = pol.path[-1].dst_dpid
                     if not any(
                         e["dpid"] == sink_dpid and e["plane"] == "policy"
-                        for e in entries[-len(pol.path) :]
+                        for e in entries[pol_start:]
                     ):
                         entries.append(
                             {
@@ -624,29 +623,13 @@ class RestAPI:
 
             # Verify each link exists in the current topology graph
             for i, lk in enumerate(links):
-                expected_src = self._graph.get_port_for_peer(lk.src_dpid, lk.dst_dpid)
-                expected_dst = self._graph.get_port_for_peer(lk.dst_dpid, lk.src_dpid)
-                if expected_src is None or expected_dst is None:
+                if not self._graph.has_edge_with_ports(
+                    lk.src_dpid, lk.src_port, lk.dst_dpid, lk.dst_port
+                ):
                     return None, (
                         f"Link at position {i} is not in the topology: "
                         f"{hex(lk.src_dpid)}:{lk.src_port} → "
-                        f"{hex(lk.dst_dpid)}:{lk.dst_port} "
-                        f"(no edge between dpids {hex(lk.src_dpid)} and "
-                        f"{hex(lk.dst_dpid)})"
-                    )
-                if expected_src != lk.src_port:
-                    return None, (
-                        f"Link at position {i} has wrong src_port: "
-                        f"{hex(lk.src_dpid)}:{lk.src_port} → "
-                        f"{hex(lk.dst_dpid)}:{lk.dst_port} "
-                        f"(expected src_port {expected_src})"
-                    )
-                if expected_dst != lk.dst_port:
-                    return None, (
-                        f"Link at position {i} has wrong dst_port: "
-                        f"{hex(lk.src_dpid)}:{lk.src_port} → "
-                        f"{hex(lk.dst_dpid)}:{lk.dst_port} "
-                        f"(expected dst_port {expected_dst})"
+                        f"{hex(lk.dst_dpid)}:{lk.dst_port}"
                     )
 
         return links, None
