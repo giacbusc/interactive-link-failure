@@ -34,20 +34,25 @@ export const HOST_SLOTS = {
 // --- DPID → slot mapping ---------------------------------------------------
 
 export const SWITCH_DPID_TO_SLOT = {
-  1: 1,
-  2: 2,
-  3: 3,
-  4: 4,
-  5: 5,
-  6: 6,
+  123917682136935: 1,
+  123917682136938: 2,
+  123917682136941: 3,
+  123917682136955: 4,
+  123917682136957: 5,
+  // ??? MODIFICAREEEEEEE PER ALTRI DPID
 };
 
 // --- MAC → host slot mapping -----------------------------------------------
 
+const CLIENT_MAC = "b8:27:eb:c2:10:5d"; // Rasp 1 (10.10.6.45)
+const SERVER_MAC = "b8:27:eb:d6:d4:c6"; // Rasp 2 (10.10.6.44)
+
 export function classifyHost(mac) {
   if (!mac) return "client";
   const lower = mac.toLowerCase();
-  if (lower.endsWith(":02") || lower.endsWith("02")) return "server";
+  if (lower === SERVER_MAC.toLowerCase()) return "server";
+  if (lower === CLIENT_MAC.toLowerCase()) return "client";
+  // Fallback: anything unknown goes left (client side)
   return "client";
 }
 
