@@ -1,18 +1,17 @@
-import { useState } from "react";
 import { COLORS } from "../theme";
 import { VIEWBOX } from "../lib/layout";
+import { linkInActivePath } from "../lib/transform";
 import SwitchNode from "./topology/SwitchNode";
 import ControllerNode from "./topology/ControllerNode";
 import HostNode from "./topology/HostNode";
 import Link from "./topology/Link";
 
-export default function TopologyView({ topology }) {
-  const [selected, setSelected] = useState(null);
-
-  // Build a position lookup so links can resolve their endpoints by id.
-  // Inactive switches/hosts (not present in the API response) are simply
-  // absent from this map, and the corresponding link is skipped by
-  // `Link` because its endpoint resolves to undefined.
+export default function TopologyView({
+  topology,
+  activePath,
+  selectedSwitch,
+  onSelectSwitch,
+}) {
   const positions = {
     ctrl: topology.controller,
     ...Object.fromEntries(topology.switches.map((s) => [s.dpid, s])),
@@ -32,7 +31,7 @@ export default function TopologyView({ topology }) {
         className="w-full h-full"
         preserveAspectRatio="xMidYMid meet"
       >
-        {/* Control plane (drawn first, behind everything) */}
+        {/* Control plane (drawn first, behind) */}
         {topology.controlLinks.map((l, i) => (
           <Link
             key={`c-${i}`}
@@ -42,15 +41,21 @@ export default function TopologyView({ topology }) {
           />
         ))}
 
-        {/* Data plane links */}
-        {topology.dataLinks.map((l, i) => (
-          <Link
-            key={`d-${i}`}
-            p1={positions[l.from]}
-            p2={positions[l.to]}
-            kind={l.status === "failed" ? "failed" : "data"}
-          />
-        ))}
+        {/* Data plane links — green if part of the active path */}
+        {topology.dataLinks.map((l, i) => {
+          let kind = l.status === "failed" ? "failed" : "data";
+          if (kind !== "failed" && linkInActivePath(l, activePath)) {
+            kind = "active";
+          }
+          return (
+            <Link
+              key={`d-${i}`}
+              p1={positions[l.from]}
+              p2={positions[l.to]}
+              kind={kind}
+            />
+          );
+        })}
 
         {/* Hosts */}
         {topology.hosts.map((h) => (
@@ -62,12 +67,12 @@ export default function TopologyView({ topology }) {
           <SwitchNode
             key={sw.dpid}
             sw={sw}
-            selected={selected === sw.dpid}
-            onClick={(s) => setSelected(s.dpid)}
+            selected={selectedSwitch?.dpid === sw.dpid}
+            onClick={() => onSelectSwitch(sw)}
           />
         ))}
 
-        {/* Controller (drawn on top) */}
+        {/* Controller on top */}
         <ControllerNode ctrl={topology.controller} />
       </svg>
     </div>

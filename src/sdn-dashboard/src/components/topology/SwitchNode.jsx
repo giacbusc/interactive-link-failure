@@ -23,11 +23,17 @@ export default function SwitchNode({ sw, selected, onClick }) {
         stroke={selected ? COLORS.info : COLORS.ink}
         strokeWidth={selected ? 2 : 1}
       />
-      <text x={0} y={5} textAnchor="middle" fontSize={13} fill={COLORS.ink}>
+      <text
+        x={0}
+        y={5}
+        textAnchor="middle"
+        fontSize={13}
+        fill={COLORS.ink}
+        style={{ userSelect: "none", pointerEvents: "none" }}
+      >
         {sw.label}
       </text>
 
-      {/* Port indicator dots below the box */}
       {sw.ports && (
         <g transform={`translate(${-(sw.ports.length * 12) / 2 + 6}, 35)`}>
           {sw.ports.map((p, i) => (

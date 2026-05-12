@@ -2,43 +2,22 @@ import { useState, useEffect, useRef } from "react";
 import { fetchTopology, fetchPortStats } from "../api/controller";
 import {
   transformTopology,
-  aggregateBytes,
+  aggregateEdgeBytes,
   computeThroughputBps,
+  buildEdgePortSet,
 } from "../lib/transform";
 
-// Topology poll cadence — fast enough that link-failure animations feel
-// reactive in the GUI, slow enough to not hammer the controller.
 const TOPOLOGY_POLL_MS = 2000;
-
-// Stats poll cadence — aligned with the controller's own StatsCollector
-// (which polls switches every 5s), so we never read a snapshot that
-// hasn't moved since last time.
 const STATS_POLL_MS = 5000;
 
-/**
- * React hook: drives the dashboard's live state from the controller's
- * REST API. Polls /topology and /stats/ports independently and exposes:
- *
- *   - topology       : transformed topology ready for <TopologyView/>,
- *                      or null while loading / when the controller is down
- *   - throughputBps  : aggregate network throughput in bits/second,
- *                      computed by interpolating two stats snapshots
- *   - controllerUp   : true when the last /topology call succeeded
- *   - error          : human-readable last error from /topology, or null
- *
- * Both polling loops are independent: a transient stats failure does not
- * mark the controller as down.
- */
 export function useController() {
   const [topology, setTopology] = useState(null);
   const [throughputBps, setThroughputBps] = useState(null);
   const [controllerUp, setControllerUp] = useState(false);
   const [error, setError] = useState(null);
 
-  // We keep the previous stats snapshot in a ref (not state) because we
-  // only need it to compute the next throughput value — re-rendering when
-  // it changes would be wasteful.
   const prevStatsRef = useRef(null);
+  const topologyRef = useRef(null);  // mirror of `topology` for the stats loop
 
   // ---- Topology polling -------------------------------------------------
 
@@ -49,7 +28,9 @@ export function useController() {
       try {
         const api = await fetchTopology();
         if (cancelled) return;
-        setTopology(transformTopology(api));
+        const t = transformTopology(api);
+        topologyRef.current = t;
+        setTopology(t);
         setControllerUp(true);
         setError(null);
       } catch (e) {
@@ -67,7 +48,10 @@ export function useController() {
     };
   }, []);
 
-  // ---- Stats polling (drives throughput) -------------------------------
+  // ---- Stats polling (drives throughput) ------------------------------
+  //
+  // We sum tx_bytes only on edge ports (host-facing). The set of edge
+  // ports is derived from the latest topology snapshot.
 
   useEffect(() => {
     let cancelled = false;
@@ -77,17 +61,16 @@ export function useController() {
         const api = await fetchPortStats();
         if (cancelled) return;
 
+        const edgePorts = buildEdgePortSet(topologyRef.current);
         const curr = {
           timestamp: Date.now() / 1000,
-          totalBytes: aggregateBytes(api),
+          totalBytes: aggregateEdgeBytes(api, edgePorts),
         };
         const bps = computeThroughputBps(prevStatsRef.current, curr);
         if (bps !== null) setThroughputBps(bps);
         prevStatsRef.current = curr;
       } catch {
-        // Keep going. If /stats/ports is down (e.g. 503 because the first
-        // stats reply hasn't arrived yet), we just leave the previous
-        // throughput on screen until we recover.
+        // ignored — keep the previous throughput on screen
       }
     };
 

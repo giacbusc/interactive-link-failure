@@ -3,20 +3,16 @@
 // The lab demo has at most 6 switches and 2 hosts (the two Raspberry Pis).
 // Every possible node has a fixed slot — the data layer only decides
 // which slots are *active*. Inactive slots are not rendered.
+// Fixed layout for the dashboard topology view.
 
 export const VIEWBOX = { width: 800, height: 600 };
-
-// --- Node sizes (must match the SVG components) ----------------------------
 
 export const SWITCH_SIZE = { w: 100, h: 44 };
 export const HOST_SIZE = { w: 110, h: 60 };
 export const CONTROLLER_SIZE = { w: 130, h: 44 };
 
-// --- Fixed positions -------------------------------------------------------
-
 export const CONTROLLER_POSITION = { x: 400, y: 60 };
 
-// Six switch slots in a 3 × 2 grid.
 export const SWITCH_SLOTS = {
   1: { x: 250, y: 220 },
   2: { x: 400, y: 220 },
@@ -31,28 +27,33 @@ export const HOST_SLOTS = {
   server: { x: 710, y: 310 },
 };
 
-// --- DPID → slot mapping ---------------------------------------------------
-
+// Tower order: top of the rack → bottom of the rack maps to slot 1 → 5.
 export const SWITCH_DPID_TO_SLOT = {
-  123917682136935: 1,
-  123917682136938: 2,
-  123917682136941: 3,
-  123917682136955: 4,
-  123917682136957: 5,
-  // ??? MODIFICAREEEEEEE PER ALTRI DPID
+  // Mininet uses small numeric DPIDs (1, 2, 3) for linear/ring/full_mesh
+  1: 1,
+  2: 2,
+  3: 3,
+  // Add the lab DPIDs back here when you switch contexts:
+  // 123917682136935: 1,
+  // 123917682136955: 2,
+  // 123917682136941: 3,
+  // 123917682136938: 4,
+  // 123917682136957: 5,
 };
 
-// --- MAC → host slot mapping -----------------------------------------------
+// Lab Raspberry Pi MACs. Update if hardware changes.
+//const CLIENT_MAC = "b8:27:eb:c2:10:5d";  // 10.10.6.45
+//const SERVER_MAC = "b8:27:eb:d6:d4:c6";  // 10.10.6.44
 
-const CLIENT_MAC = "b8:27:eb:c2:10:5d"; // Rasp 1 (10.10.6.45)
-const SERVER_MAC = "b8:27:eb:d6:d4:c6"; // Rasp 2 (10.10.6.44)
+const CLIENT_MAC = "00:00:00:00:00:01";  // h1 in Mininet
+const SERVER_MAC = "00:00:00:00:00:02";  // h2 in Mininet
+
 
 export function classifyHost(mac) {
   if (!mac) return "client";
   const lower = mac.toLowerCase();
   if (lower === SERVER_MAC.toLowerCase()) return "server";
   if (lower === CLIENT_MAC.toLowerCase()) return "client";
-  // Fallback: anything unknown goes left (client side)
   return "client";
 }
 
@@ -62,40 +63,28 @@ export function hostLabel(slot) {
     : { label: "VLC Client", subtitle: "(Rasp. 1)" };
 }
 
-// --- Edge anchor helpers ---------------------------------------------------
+// --- Geometry helpers ------------------------------------------------------
 
 function clipToBox(from, to, size) {
   const dx = to.x - from.x;
   const dy = to.y - from.y;
   if (dx === 0 && dy === 0) return { x: from.x, y: from.y };
-
   const hw = size.w / 2;
   const hh = size.h / 2;
-
   const tx = dx === 0 ? Infinity : hw / Math.abs(dx);
   const ty = dy === 0 ? Infinity : hh / Math.abs(dy);
   const t = Math.min(tx, ty);
-
   return { x: from.x + dx * t, y: from.y + dy * t };
 }
 
 export function linkEndpoints(p1, size1, p2, size2) {
-  return {
-    a: clipToBox(p1, p2, size1),
-    b: clipToBox(p2, p1, size2),
-  };
+  return { a: clipToBox(p1, p2, size1), b: clipToBox(p2, p1, size2) };
 }
 
-// --- Link routing ----------------------------------------------------------
-//
-// Some pairs of slots are collinear with a third slot, so a straight line
-// would pass through (and hide) the intermediate node. For those pairs we
-// override the rendering to use a Bezier arc that curves above or below.
+// --- Link routing (arcs over collinear nodes) ------------------------------
 
 const LINK_OVERRIDES = {
-  // Top row: 1—3 jumps over 2 → arc upward
   "switch:1-switch:3": { kind: "arc", arcOffset: -90 },
-  // Bottom row: 4—6 jumps over 5 → arc downward
   "switch:4-switch:6": { kind: "arc", arcOffset: 90 },
 };
 
@@ -104,6 +93,7 @@ function endpointKey(endpoint) {
   if (endpoint.kind === "client" || endpoint.kind === "server") {
     return `host:${endpoint.kind}`;
   }
+  if (endpoint.slot !== undefined) return `switch:${endpoint.slot}`;
   if (endpoint.dpid !== undefined) return `switch:${endpoint.dpid}`;
   return "unknown";
 }
@@ -114,11 +104,6 @@ function overrideKey(p1, p2) {
   return k1 < k2 ? `${k1}-${k2}` : `${k2}-${k1}`;
 }
 
-/**
- * Compute the SVG path "d" attribute for a link between two nodes.
- * Straight line by default; quadratic Bezier arc when LINK_OVERRIDES
- * has an entry for the (slot-A, slot-B) pair.
- */
 export function linkPath(p1, size1, p2, size2) {
   const { a, b } = linkEndpoints(p1, size1, p2, size2);
   const override = LINK_OVERRIDES[overrideKey(p1, p2)];
@@ -127,13 +112,12 @@ export function linkPath(p1, size1, p2, size2) {
     return `M ${a.x} ${a.y} L ${b.x} ${b.y}`;
   }
 
-  // Quadratic Bezier with control point perpendicular to the segment
   const mx = (a.x + b.x) / 2;
   const my = (a.y + b.y) / 2;
   const dx = b.x - a.x;
   const dy = b.y - a.y;
   const len = Math.sqrt(dx * dx + dy * dy) || 1;
-  const px = -dy / len; // perpendicular unit vector
+  const px = -dy / len;
   const py = dx / len;
   const off = override.arcOffset;
   const cx = mx + px * off;

@@ -1,10 +1,3 @@
-// Pure transformations between the controller's REST responses and the
-// shape the GUI components expect. Kept as pure functions so they can be
-// unit-tested without React.
-//
-// Layout decisions (positions, slot assignment) live in `layout.js`.
-// This file only handles the data-shape conversion.
-
 import {
   CONTROLLER_POSITION,
   SWITCH_SLOTS,
@@ -14,60 +7,49 @@ import {
   hostLabel,
 } from "./layout";
 
-// -- Topology -----------------------------------------------------------
-
-/**
- * Convert a /topology response to the shape TopologyView expects.
- * Returns null if input is null (still loading).
- *
- * The layout is fixed: every switch DPID has a predetermined slot, and
- * the two hosts have predetermined left/right positions. Only entities
- * that appear in the API response are rendered — everything else is
- * simply absent.
- *
- * Defensive: handles both "switches: [int]" (current backend) and the
- * proposed "switches: [{dpid, ports}]" enriched shape.
- */
 export function transformTopology(api) {
   if (!api) return null;
 
-  // -- Switches: project DPIDs onto fixed slots --------------------------
+  // -- Switches --
 
   const rawSwitches = api.switches || [];
   const switches = [];
   for (const s of rawSwitches) {
-    const dpid = typeof s === "number" ? s : s.dpid;
+    const isObj = typeof s === "object";
+    const dpid = isObj ? s.dpid : s;
     const slot = SWITCH_DPID_TO_SLOT[dpid];
     if (slot == null) {
-      // Unmapped DPID: skip rather than overlap an existing slot.
-      // Extend SWITCH_DPID_TO_SLOT in layout.js to add support.
       console.warn(`Unmapped switch DPID ${dpid} — skipping`);
       continue;
     }
     const pos = SWITCH_SLOTS[slot];
     switches.push({
       dpid,
-      label: `Switch ${dpid}`,
+      slot,
+      label: `Switch ${slot}`,
       x: pos.x,
       y: pos.y,
-      slot,
+      // Optional metadata from the enriched API response. Will populate
+      // the details panel when the user clicks the switch.
+      vendor: isObj ? s.vendor : undefined,
+      hw_desc: isObj ? s.hw_desc : undefined,
+      sw_desc: isObj ? s.sw_desc : undefined,
+      num_ports: isObj ? s.num_ports : undefined,
+      main_table: isObj ? s.main_table : undefined,
     });
   }
 
-  // -- Hosts: each MAC goes to its dedicated client/server slot ---------
-  //
-  // Two hosts on the same switch is now correct: they end up in two
-  // different slots (left / right of the canvas) regardless of which
-  // switch they attach to.
+  const switchPosByDpid = Object.fromEntries(
+    switches.map((s) => [s.dpid, { x: s.x, y: s.y, slot: s.slot }])
+  );
+
+  // -- Hosts --
 
   const rawHosts = api.hosts || [];
   const hostsBySlot = {};
   for (const h of rawHosts) {
     const slot = classifyHost(h.mac);
     if (hostsBySlot[slot]) {
-      // More than one MAC mapped to the same role. Keep the first and
-      // warn — better than overlap. The lab demo only has two Pis so
-      // this should not happen in practice.
       console.warn(
         `Multiple hosts mapped to slot "${slot}", keeping ${hostsBySlot[slot].mac}, ignoring ${h.mac}`
       );
@@ -81,39 +63,42 @@ export function transformTopology(api) {
     const { label, subtitle } = hostLabel(slot);
     return {
       id: h.mac,
+      mac: h.mac,
+      ips: h.ips || [],
       label,
       subtitle,
       kind: slot,
       attachedTo: h.dpid,
+      attachedPort: h.port,   // NEW — needed for edge-port throughput
       x: pos.x,
       y: pos.y,
     };
   });
 
-  // -- Links -------------------------------------------------------------
+  // -- Links --
 
-  // Control plane: synthetic, controller is logically connected to every
-  // switch the API reports.
+  const knownDpids = new Set(switches.map((s) => s.dpid));
+
   const controlLinks = switches.map((s) => ({ from: "ctrl", to: s.dpid }));
 
-  // Data plane: only links whose endpoints are known to us. If the
-  // backend reports a link to an unmapped DPID we drop it so we don't
-  // draw lines into the void.
-  const knownDpids = new Set(switches.map((s) => s.dpid));
   const switchLinks = (api.links || [])
-    .filter(
-      (l) => knownDpids.has(l.src_dpid) && knownDpids.has(l.dst_dpid)
-    )
+    .filter((l) => knownDpids.has(l.src_dpid) && knownDpids.has(l.dst_dpid))
     .map((l) => ({
       from: l.src_dpid,
       to: l.dst_dpid,
       src_port: l.src_port,
       dst_port: l.dst_port,
+      kind: "switch-switch",
     }));
 
   const hostLinks = hosts
     .filter((h) => knownDpids.has(h.attachedTo))
-    .map((h) => ({ from: h.attachedTo, to: h.id }));
+    .map((h) => ({
+      from: h.attachedTo,
+      to: h.id,
+      src_port: h.attachedPort,
+      kind: "host",
+    }));
 
   return {
     controller: CONTROLLER_POSITION,
@@ -125,42 +110,100 @@ export function transformTopology(api) {
   };
 }
 
-// -- Throughput interpolation -------------------------------------------
+// -- Throughput interpolation (NEW: edge-port only) ----------------------
 
 /**
- * Sum tx_bytes + rx_bytes across every (switch, port) in the stats
- * response. Each byte traversing a link is counted twice (tx on the
- * sender's port, rx on the receiver's port), which is why
- * `computeThroughputBps` divides the delta by 2 before converting to bps.
+ * Sum tx_bytes ONLY on edge ports (host-facing). Each byte transmitted
+ * by the network to a host is counted once here, so the resulting
+ * throughput represents the user-visible stream rate (not the
+ * link-replicated aggregate of before).
  */
-export function aggregateBytes(statsResponse) {
+export function aggregateEdgeBytes(statsResponse, edgePortSet) {
   if (!statsResponse?.switches) return 0;
-  return statsResponse.switches.reduce(
-    (acc, sw) =>
-      acc +
-      (sw.ports || []).reduce(
-        (a, p) => a + (p.tx_bytes || 0) + (p.rx_bytes || 0),
-        0
-      ),
-    0
-  );
+  let total = 0;
+  for (const sw of statsResponse.switches) {
+    for (const p of sw.ports || []) {
+      const key = `${sw.dpid}:${p.port_no}`;
+      if (edgePortSet.has(key)) {
+        // tx_bytes from the switch perspective = bytes delivered to host
+        total += p.tx_bytes || 0;
+      }
+    }
+  }
+  return total;
 }
 
 /**
- * Compute aggregate network throughput in bits/second from two
- * consecutive snapshots.
- *
- *   prev / curr: { timestamp: seconds, totalBytes: number }
- *
- * Returns null when there is no previous snapshot, or when the delta is
- * negative (counter wrap or controller restart).
+ * Compute throughput in bps from two snapshots of edge-port bytes.
+ * Returns null on first sample / counter wrap / clock skew.
  */
 export function computeThroughputBps(prev, curr) {
   if (!prev || !curr) return null;
   if (prev.timestamp == null || curr.timestamp == null) return null;
   const dt = curr.timestamp - prev.timestamp;
   if (dt <= 0) return null;
-  const dBytes = (curr.totalBytes - prev.totalBytes) / 2;
+  const dBytes = curr.totalBytes - prev.totalBytes;
   if (dBytes < 0) return null;
   return (dBytes * 8) / dt;
+}
+
+/**
+ * Build the Set of "dpid:port_no" strings for every edge port in the
+ * current topology. Pass this to aggregateEdgeBytes.
+ */
+export function buildEdgePortSet(topology) {
+  if (!topology?.hosts) return new Set();
+  const set = new Set();
+  for (const h of topology.hosts) {
+    if (h.attachedTo != null && h.attachedPort != null) {
+      set.add(`${h.attachedTo}:${h.attachedPort}`);
+    }
+  }
+  return set;
+}
+
+// -- Path matching helpers (for green highlight) -------------------------
+
+/**
+ * Given the response from GET /path/{src}/{dst} (which contains
+ * `hops: [{dpid, in_port, out_port}, ...]` plus src_mac / dst_mac),
+ * decide whether a specific data-link is part of the active path.
+ *
+ * Works for both switch-switch links and switch-host edge links.
+ */
+export function linkInActivePath(link, activePath) {
+  if (!activePath?.hops?.length) return false;
+  const hops = activePath.hops;
+
+  // 1) Switch-switch links: any pair of consecutive hops with matching dpids
+  for (let i = 0; i < hops.length - 1; i++) {
+    const a = hops[i].dpid;
+    const b = hops[i + 1].dpid;
+    if (
+      (link.from === a && link.to === b) ||
+      (link.from === b && link.to === a)
+    ) {
+      return true;
+    }
+  }
+
+  // 2) Host-to-first-switch
+  const first = hops[0];
+  if (
+    (link.from === activePath.src_mac && link.to === first.dpid) ||
+    (link.from === first.dpid && link.to === activePath.src_mac)
+  ) {
+    return true;
+  }
+
+  // 3) Last-switch-to-host
+  const last = hops[hops.length - 1];
+  if (
+    (link.from === last.dpid && link.to === activePath.dst_mac) ||
+    (link.from === activePath.dst_mac && link.to === last.dpid)
+  ) {
+    return true;
+  }
+
+  return false;
 }

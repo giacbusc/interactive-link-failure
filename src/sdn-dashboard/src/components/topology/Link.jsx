@@ -19,9 +19,7 @@ export default function Link({ p1, p2, kind = "data" }) {
   const size1 = kind === "control" ? CONTROLLER_SIZE : sizeOf(p1);
   const size2 = sizeOf(p2);
 
-  // Tag the controller endpoint so layout helpers can identify it.
   const annotated1 = kind === "control" ? { ...p1, kind: "controller" } : p1;
-
   const d = linkPath(annotated1, size1, p2, size2);
 
   if (kind === "control") {
@@ -45,6 +43,27 @@ export default function Link({ p1, p2, kind = "data" }) {
         strokeWidth={2}
         strokeDasharray="5 4"
       />
+    );
+  }
+
+  if (kind === "active") {
+    // Render two layers: a soft halo behind, the main stroke on top.
+    return (
+      <g>
+        <path
+          d={d}
+          fill="none"
+          stroke={COLORS.linkActive}
+          strokeWidth={6}
+          opacity={0.25}
+        />
+        <path
+          d={d}
+          fill="none"
+          stroke={COLORS.linkActive}
+          strokeWidth={2.5}
+        />
+      </g>
     );
   }
 

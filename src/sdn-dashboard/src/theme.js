@@ -30,4 +30,6 @@ export const COLORS = {
   linkColor: "#1F1F1F",
   linkFailed: "#C8312E",
   controlLink: "#9CA3AF",
+  linkActive: "#16A34A",      // green for the currently used path
+  linkCandidate: "#3B82F6",   // light blue for the path being picked
 };
