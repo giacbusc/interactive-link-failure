@@ -5,7 +5,8 @@ import EventList from "./EventList";
 
 export default function Sidebar({
   algorithm,
-  setAlgorithm,
+  onSelectDijkstra,
+  onSelectManual,
   throughputBps,
   events,
 }) {
@@ -14,7 +15,11 @@ export default function Sidebar({
       className="w-72 flex-shrink-0 p-6 space-y-7 overflow-y-auto"
       style={{ backgroundColor: COLORS.sidebar }}
     >
-      <AlgorithmSelector selected={algorithm} onChange={setAlgorithm} />
+      <AlgorithmSelector
+        current={algorithm}
+        onSelectDijkstra={onSelectDijkstra}
+        onSelectManual={onSelectManual}
+      />
       <MetricsGrid throughputBps={throughputBps} />
       <EventList events={events} />
     </aside>
