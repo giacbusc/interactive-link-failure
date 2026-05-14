@@ -13,14 +13,36 @@ function sizeOf(node, kind) {
   return SWITCH_SIZE;
 }
 
-export default function Link({ p1, p2, kind = "data" }) {
+/**
+ * Data-plane link. Variants:
+ *   - data    : default, black line
+ *   - active  : currently used by /path — green with halo
+ *   - failed  : reported as down — red dashed
+ *   - control : controller↔switch — grey dashed
+ *
+ * onClick (only for data-plane variants) lets the user simulate a
+ * failure of this link (interpretation B in App.jsx).
+ */
+export default function Link({ p1, p2, kind = "data", onClick }) {
   if (!p1 || !p2) return null;
 
   const size1 = kind === "control" ? CONTROLLER_SIZE : sizeOf(p1);
   const size2 = sizeOf(p2);
-
   const annotated1 = kind === "control" ? { ...p1, kind: "controller" } : p1;
   const d = linkPath(annotated1, size1, p2, size2);
+
+  // The clickable "hit area": invisible wider path drawn UNDER the
+  // visible line, so clicking near it works even if the line is thin.
+  const hitArea = onClick ? (
+    <path
+      d={d}
+      fill="none"
+      stroke="transparent"
+      strokeWidth={14}
+      style={{ cursor: "pointer", pointerEvents: "stroke" }}
+      onClick={onClick}
+    />
+  ) : null;
 
   if (kind === "control") {
     return (
@@ -36,20 +58,23 @@ export default function Link({ p1, p2, kind = "data" }) {
 
   if (kind === "failed") {
     return (
-      <path
-        d={d}
-        fill="none"
-        stroke={COLORS.linkFailed}
-        strokeWidth={2}
-        strokeDasharray="5 4"
-      />
+      <g>
+        {hitArea}
+        <path
+          d={d}
+          fill="none"
+          stroke={COLORS.linkFailed}
+          strokeWidth={2}
+          strokeDasharray="5 4"
+        />
+      </g>
     );
   }
 
   if (kind === "active") {
-    // Render two layers: a soft halo behind, the main stroke on top.
     return (
       <g>
+        {hitArea}
         <path
           d={d}
           fill="none"
@@ -68,11 +93,14 @@ export default function Link({ p1, p2, kind = "data" }) {
   }
 
   return (
-    <path
-      d={d}
-      fill="none"
-      stroke={COLORS.linkColor}
-      strokeWidth={1}
-    />
+    <g>
+      {hitArea}
+      <path
+        d={d}
+        fill="none"
+        stroke={COLORS.linkColor}
+        strokeWidth={1}
+      />
+    </g>
   );
 }
